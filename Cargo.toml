@@ -1,0 +1,37 @@
+[workspace]
+resolver = "3"
+members = ["packages/shared", "packages/bots/funding-basis"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+license = "Apache-2.0"
+publish = false
+
+[workspace.dependencies]
+# Local crates
+bot-shared = { path = "packages/shared" }
+
+# The SDK a strategy is written against. It is declared by version, and a
+# local checkout is patched in through .cargo/config.toml while both move
+# together; the build service supplies its own pinned copy the same way, so
+# `--locked` holds on both sides.
+shonin-strategy-sdk = "0.1.0"
+
+futures = "0.3.34"
+serde = { version = "1.0.229", features = ["derive"] }
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[profile.release]
+# A strategy is a component the build service compiles twice and compares, so
+# the profile is part of what makes it reproducible.
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true

@@ -1,0 +1,19 @@
+[package]
+name = "funding-basis"
+description = "Holds spot, shorts the perp, and collects the funding between them"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+bot-shared.workspace = true
+futures.workspace = true
+shonin-strategy-sdk.workspace = true
+
+[lints]
+workspace = true

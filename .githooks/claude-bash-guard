@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+# Claude Code PreToolUse guard, wired up in the local (gitignored)
+# .claude/settings.json. It keeps an AI assistant from getting around the
+# commit guard in .githooks/commit-msg. It only ever denies, never asks, so
+# unattended runs (e.g. /loop) are never left waiting on a prompt.
+#
+# Denied:
+# - skipping git hooks (--no-verify, `commit -n`) or repointing core.hooksPath;
+# - setting SHONIN_SKIP_REVIEW or SHONIN_GUARD_UNLOCK, or running Claude with
+#   hooks disabled;
+# - writing to the guard's own files (.githooks/, .private/, .claude/settings*),
+#   with the file tools or with shell commands. Reading or mentioning them
+#   (in a commit message, say) is fine.
+#
+# To change the guard files with an assistant's help, a human starts the
+# session with SHONIN_GUARD_UNLOCK=1. The bypass rules still apply.
+#
+# Reads the hook payload (JSON) on stdin. Prints a deny decision as JSON, or
+# nothing to leave the decision to the normal permission flow.
+set -euo pipefail
+
+input="$(cat)"
+tool="$(jq -r '.tool_name // ""' <<<"$input")"
+unlocked="${SHONIN_GUARD_UNLOCK:-}"
+
+deny() {
+  jq -n --arg reason "Commit guard: $1" '{
+    hookSpecificOutput: {
+      hookEventName: "PreToolUse",
+      permissionDecision: "deny",
+      permissionDecisionReason: $reason
+    }
+  }'
+  exit 0
+}
+
+# A guard file: the name starts the string or follows a character that can't
+# be part of a name (/, space, quote, =, >).
+guard_file='(^|[^[:alnum:]_.-])\.(githooks/|private(/|[[:space:]"'"'"']|$)|claude/settings)'
+# A redirect whose target is a guard file.
+redirect_into='>>?[[:space:]]*["'"'"']?[^[:space:]&|;]*\.(githooks/|private|claude/settings)'
+# A command that writes, moves or deletes the files it names.
+writes='(^|[[:space:];&|(])(tee|rm|mv|cp|chmod|chown|truncate|touch|ln|install|dd|sed[[:space:]]+(-[[:alpha:]]*i|--in-place)|perl[[:space:]]+-[[:alpha:]]*i|git[[:space:]]+(rm|mv|checkout|restore))([[:space:]]|$)'
+
+case "$tool" in
+Bash)
+  cmd="$(jq -r '.tool_input.command // ""' <<<"$input")"
+
+  # grep matches line by line, and each bypass rule needs the git (or claude)
+  # invocation on the same line, before any |, ; or &. Prose that only
+  # mentions a flag, such as a commit message body, doesn't match.
+  if grep -qE 'git[^|;&]*[[:space:]]--no-verify([[:space:]=]|$)' <<<"$cmd"; then
+    deny "--no-verify skips the repository's commit checks. Fix what the check reports instead."
+  fi
+  if grep -qE 'git[^|;&]*[[:space:]]commit([[:space:]][^|;&]*)?[[:space:]]-[[:alpha:]]*n[[:alpha:]]*([[:space:]]|$)' <<<"$cmd"; then
+    deny "\`git commit -n\` skips the repository's commit checks. Fix what the check reports instead."
+  fi
+  if grep -qiE 'git[^|;&]*core\.hookspath' <<<"$cmd" &&
+    ! grep -qE '^[[:space:]]*git config core\.hooksPath \.githooks[[:space:]]*$' <<<"$cmd"; then
+    deny "changing core.hooksPath would disable the repository's commit checks."
+  fi
+  if grep -qE '(^|[[:space:];&|(])(export[[:space:]]+)?(SHONIN_SKIP_REVIEW|SHONIN_GUARD_UNLOCK|CLAUDE_CODE_SIMPLE)=' <<<"$cmd"; then
+    deny "that variable disables part of the guard. Only a human may set it, outside Claude."
+  fi
+  if grep -qE 'claude[^|;&]*[[:space:]]--bare([[:space:]]|$)|disableAllHooks' <<<"$cmd"; then
+    deny "running Claude with hooks disabled would skip this guard."
+  fi
+
+  if [ "$unlocked" != 1 ]; then
+    guard_lines="$(grep -E "$guard_file" <<<"$cmd" || true)"
+    if [ -n "$guard_lines" ] &&
+      { grep -qE "$redirect_into" <<<"$guard_lines" || grep -qE "$writes" <<<"$guard_lines"; }; then
+      deny "the guard's own files (.githooks/, .private/, .claude/settings) are read-only for assistants. Ask the human to change them, or to start the session with SHONIN_GUARD_UNLOCK=1."
+    fi
+  fi
+  ;;
+Edit | Write | MultiEdit | NotebookEdit)
+  path="$(jq -r '.tool_input.file_path // .tool_input.notebook_path // ""' <<<"$input")"
+  if [ "$unlocked" != 1 ] && grep -qE "$guard_file" <<<"$path"; then
+    deny "the guard's own files (.githooks/, .private/, .claude/settings) are read-only for assistants. Ask the human to change them, or to start the session with SHONIN_GUARD_UNLOCK=1."
+  fi
+  ;;
+esac

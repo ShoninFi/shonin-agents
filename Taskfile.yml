@@ -1,0 +1,91 @@
+# The bots: strategies published to a running Shonin platform.
+version: "3"
+silent: true
+dotenv: [".env"]
+
+vars:
+  API_URL:
+    sh: echo "${SHONIN_API_URL:-http://localhost:19081}"
+  PLATFORM_DIR:
+    sh: echo "${SHONIN_PLATFORM_DIR:-}"
+
+tasks:
+  default:
+    cmds:
+      - task --list
+
+  setup:
+    desc: "Install the toolchain, enable the commit guard, and point the SDK at a local platform"
+    cmds:
+      - rustup show active-toolchain || rustup toolchain install
+      - git config core.hooksPath .githooks
+      - |
+        for bin in cargo gitleaks claude jq; do
+          command -v "$bin" >/dev/null || echo "missing: $bin (see README.md)"
+        done
+        for f in .private/terms.txt .private/review.md; do
+          [ -f "$f" ] || echo "missing: $f (commit guard input; commits are blocked until it exists)"
+        done
+      - task: patch
+
+  patch:
+    desc: "Point the SDK at a local platform checkout (SHONIN_PLATFORM_DIR)"
+    cmds:
+      - |
+        if [ -z "{{.PLATFORM_DIR}}" ]; then
+          echo "SHONIN_PLATFORM_DIR is unset: the SDK resolves from the registry."
+          rm -f .cargo/config.toml
+          exit 0
+        fi
+        mkdir -p .cargo
+        cat > .cargo/config.toml <<EOF
+        # Written by \`task patch\`; gitignored. The SDK is declared by version
+        # in Cargo.toml and resolved from a checkout while the two move together.
+        [patch.crates-io]
+        shonin-strategy-sdk = { path = "{{.PLATFORM_DIR}}/packages/strategy-sdk" }
+        EOF
+        echo "SDK patched to {{.PLATFORM_DIR}}"
+
+  build:
+    desc: "Build every bot as a component"
+    cmds:
+      - cargo build --release --locked --target wasm32-wasip2 -p funding-basis
+
+  publish:
+    desc: "Publish a bot to a running platform (BOT=funding-basis)"
+    vars:
+      BOT: '{{.BOT | default "funding-basis"}}'
+    cmds:
+      - shonin publish "packages/bots/{{.BOT}}" --api "{{.API_URL}}"
+
+  dev:
+    desc: "Publish funding-basis to a platform running locally and follow the build"
+    cmds:
+      - task: publish
+
+  check:
+    desc: "Compile every crate, natively and as a component"
+    cmds:
+      - cargo check --workspace --all-targets
+      - cargo check -p funding-basis --target wasm32-wasip2
+
+  lint:
+    desc: "rustfmt --check and clippy -D warnings"
+    cmds:
+      - cargo fmt --all --check
+      - cargo clippy --workspace --all-targets -- -D warnings
+      - cargo clippy -p funding-basis --target wasm32-wasip2 -- -D warnings
+
+  fmt:
+    desc: "Format every crate"
+    cmds:
+      - cargo fmt --all
+
+  test:
+    desc: "Native tests"
+    cmds:
+      - cargo test --workspace
+
+  clean:
+    cmds:
+      - cargo clean
