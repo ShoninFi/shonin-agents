@@ -1,0 +1,53 @@
+[strategy]
+id = "funding-basis"
+version = 1
+
+[description]
+title = "Funding basis"
+text = """
+Holds the spot asset and shorts the perpetual against it, so the position has \
+no view on the price, and collects the funding the shorts are paid while the \
+two disagree. When funding turns against the carry it unwinds, and when it \
+turns far enough the other way it holds the position the other way round.
+
+The edge is mechanical and it compresses as more capital chases it, which is \
+the honest thing to say about it: the record shows the size it was earned at, \
+and a larger vault should expect less.
+"""
+limits = [
+    "Gross exposure at most twice the vault's value",
+    "No single order above 5% of the vault",
+    "5% of the vault kept liquid, so an ordinary withdrawal closes nothing",
+    "Only reduces after a 10% fall from the vault's peak",
+    "One market, named in the config, and nothing else",
+]
+dependencies = [
+    "the venue's own account stream, for its fills and its funding",
+    "the venue's own prices, through the executor's shared data layer",
+]
+
+[config]
+market_spot = "BTC"
+market_perp = "BTC-PERP"
+# Funding, as a fraction of notional per day, at which carrying is worth it.
+entry_funding = "0.0002"
+# And at which an open carry is unwound.
+exit_funding = "0.00005"
+# How much of the vault to aim to have working.
+target_deployment = "0.80"
+max_gross_leverage = "2"
+max_order_fraction = "0.10"
+idle_buffer = "0.05"
+drawdown_stop = "0.10"
+minimum_notional = "100"
+
+[venues.local]
+accounts = ["venue"]
+
+[runtime.allowances]
+fuel_per_sec = 2_000_000
+memory_mib = 256
+requests_per_min = 120
+bytes_per_day = 50_000_000
+streams = 4
+inference_ms_per_min = 0
