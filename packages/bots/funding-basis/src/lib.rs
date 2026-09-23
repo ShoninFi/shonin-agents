@@ -335,3 +335,45 @@ async fn submit(actions: &[Action]) -> Result<Vec<Verdict>, String> {
 }
 
 sdk::export_strategy!(FundingBasis);
+
+#[cfg(test)]
+mod tests {
+    use bot_shared::{Limits, size_for};
+    use strategy_sdk::{Decimal, decimal};
+
+    /// The settings this strategy actually ships with, read from its own
+    /// manifest so a test cannot drift from what runs.
+    fn shipped(key: &str) -> Decimal {
+        let manifest = include_str!("../shonin.toml");
+        let line = manifest
+            .lines()
+            .find(|line| line.trim_start().starts_with(&format!("{key} =")))
+            .unwrap_or_else(|| panic!("the manifest declares {key}"));
+        let value = line.split('=').nth(1).expect("a value").trim();
+        value.trim_matches('"').parse().expect("a decimal")
+    }
+
+    /// A strategy whose own per-order cap is below its own minimum order can
+    /// never open a position, and would sit there looking healthy while doing
+    /// nothing. The two numbers have to leave room for each other at the size
+    /// a vault this strategy is meant for actually holds.
+    #[test]
+    fn the_shipped_limits_can_open_a_position() {
+        let limits = Limits {
+            max_gross_leverage: shipped("max_gross_leverage"),
+            max_order_fraction: shipped("max_order_fraction"),
+            idle_buffer: shipped("idle_buffer"),
+            drawdown_stop: shipped("drawdown_stop"),
+        };
+        let minimum = shipped("minimum_notional");
+        let smallest_vault = decimal("2000");
+
+        let wanted = smallest_vault * shipped("target_deployment");
+        let step = size_for(wanted, smallest_vault, decimal("0"), &limits, minimum);
+        assert!(
+            step > decimal("0"),
+            "a {smallest_vault} vault could not open a position: a step of \
+             {step} against a minimum of {minimum}"
+        );
+    }
+}
