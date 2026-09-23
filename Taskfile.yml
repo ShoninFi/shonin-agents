@@ -3,11 +3,9 @@ version: "3"
 silent: true
 dotenv: [".env"]
 
-vars:
-  API_URL:
-    sh: echo "${SHONIN_API_URL:-http://localhost:19081}"
-  PLATFORM_DIR:
-    sh: echo "${SHONIN_PLATFORM_DIR:-}"
+# `.env` is read into every command's environment, so the settings are read
+# there rather than into Task's own variables: a variable computed with `sh:`
+# runs before the file is loaded and would always come back empty.
 
 tasks:
   default:
@@ -32,7 +30,7 @@ tasks:
     desc: "Point the SDK at a local platform checkout (SHONIN_PLATFORM_DIR)"
     cmds:
       - |
-        if [ -z "{{.PLATFORM_DIR}}" ]; then
+        if [ -z "${SHONIN_PLATFORM_DIR:-}" ]; then
           echo "SHONIN_PLATFORM_DIR is unset: the SDK resolves from the registry."
           rm -f .cargo/config.toml
           exit 0
@@ -42,7 +40,7 @@ tasks:
         # Written by \`task patch\`; gitignored. The SDK is declared by version
         # in Cargo.toml and resolved from a checkout while the two move together.
         [patch.crates-io]
-        shonin-strategy-sdk = { path = "{{.PLATFORM_DIR}}/packages/strategy-sdk" }
+        shonin-strategy-sdk = { path = "${SHONIN_PLATFORM_DIR}/packages/strategy-sdk" }
         EOF
         echo "SDK patched to {{.PLATFORM_DIR}}"
 
@@ -56,7 +54,23 @@ tasks:
     vars:
       BOT: '{{.BOT | default "funding-basis"}}'
     cmds:
-      - shonin publish "packages/bots/{{.BOT}}" --api "{{.API_URL}}"
+      # The platform's own command does the publishing. A checkout of the
+      # platform runs it from there, so nothing has to be installed first;
+      # otherwise it has to be on the path.
+      - |
+        api="${SHONIN_API_URL:-http://localhost:19081}"
+        rpc="${SHONIN_RPC_URL:-http://localhost:19083}"
+        if [ -n "${SHONIN_PLATFORM_DIR:-}" ]; then
+          cargo run -q --manifest-path "${SHONIN_PLATFORM_DIR}/Cargo.toml" -p shonin-cli -- \
+            --api "$api" --rpc-url "$rpc" \
+            --deployments "${SHONIN_PLATFORM_DIR}/.shonin/local/deployments.json" \
+            publish "$PWD/packages/bots/{{.BOT}}"
+        elif command -v shonin >/dev/null; then
+          shonin --api "$api" --rpc-url "$rpc" publish "packages/bots/{{.BOT}}"
+        else
+          echo "No shonin command: set SHONIN_PLATFORM_DIR to a platform checkout, or put shonin on the path."
+          exit 1
+        fi
 
   dev:
     desc: "Publish funding-basis to a platform running locally and follow the build"
