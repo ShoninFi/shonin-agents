@@ -3,6 +3,13 @@
 version = 4
 
 [[package]]
+name = "agent-shared"
+version = "0.1.0"
+dependencies = [
+ "shonin-strategy-sdk",
+]
+
+[[package]]
 name = "anyhow"
 version = "1.0.104"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -28,13 +35,6 @@ checksum = "f781dba93de3a5ef6dc5b17c9958b208f6f3f021623b360fb605ea51ce443f10"
 dependencies = [
  "serde",
  "serde-big-array",
-]
-
-[[package]]
-name = "bot-shared"
-version = "0.1.0"
-dependencies = [
- "shonin-strategy-sdk",
 ]
 
 [[package]]
@@ -104,7 +104,7 @@ checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 name = "funding-basis"
 version = "0.1.0"
 dependencies = [
- "bot-shared",
+ "agent-shared",
  "futures",
  "shonin-strategy-sdk",
 ]

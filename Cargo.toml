@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["packages/shared", "packages/bots/funding-basis"]
+members = ["packages/shared", "packages/agents/funding-basis"]
 
 [workspace.package]
 version = "0.1.0"
@@ -11,7 +11,7 @@ publish = false
 
 [workspace.dependencies]
 # Local crates
-bot-shared = { path = "packages/shared" }
+agent-shared = { path = "packages/shared" }
 
 # The SDK a strategy is written against. It is declared by version, and a
 # local checkout is patched in through .cargo/config.toml while both move

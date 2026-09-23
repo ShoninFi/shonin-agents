@@ -1,4 +1,4 @@
-//! How big a position a bot will take, and what stops it.
+//! How big a position an agent will take, and what stops it.
 //!
 //! The limits here are the strategy's own, written where a reader and a
 //! reviewer can both find them. They are deliberately dull: a ceiling on

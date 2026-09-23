@@ -1,6 +1,6 @@
 [package]
-name = "bot-shared"
-description = "Helpers every bot here shares"
+name = "agent-shared"
+description = "Helpers every agent here shares"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

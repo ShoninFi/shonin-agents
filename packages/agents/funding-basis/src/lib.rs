@@ -16,7 +16,7 @@
 //! depositor reading the page and a reviewer reading the source are looking at
 //! the same promises.
 
-use bot_shared::{Config, Limits, size_for};
+use agent_shared::{Config, Limits, size_for};
 use futures::StreamExt;
 use sdk::{
     Account, AccountState, Action, Decimal, Order, Side, Verdict, from_payload, to_payload, vault,
@@ -338,7 +338,7 @@ sdk::export_strategy!(FundingBasis);
 
 #[cfg(test)]
 mod tests {
-    use bot_shared::{Limits, size_for};
+    use agent_shared::{Limits, size_for};
     use strategy_sdk::{Decimal, decimal};
 
     /// The settings this strategy actually ships with, read from its own

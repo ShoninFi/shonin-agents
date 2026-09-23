@@ -11,7 +11,7 @@ publish.workspace = true
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-bot-shared.workspace = true
+agent-shared.workspace = true
 futures.workspace = true
 shonin-strategy-sdk.workspace = true
 

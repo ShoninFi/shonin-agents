@@ -1,4 +1,4 @@
-//! What every bot here needs and the SDK does not provide: reading the config
+//! What every agent here needs and the SDK does not provide: reading the config
 //! its manifest declares, and sizing a position against limits it wrote down
 //! itself.
 //!

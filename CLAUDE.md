@@ -1,15 +1,15 @@
-# Shonin Bots
+# Shonin Agents
 
-The reference strategies: WASM components compiled from this repository and published to a Shonin platform. See `README.md` for the layout and the quickstart.
+The reference agents: WASM components compiled from this repository and published to a Shonin platform. An **agent** is the program; a **strategy** is what it is trying to do, and it is the word the platform's contracts use. See `README.md` for the layout and the quickstart.
 
 ## Rules
 
 - **This repository is public.** Never mention other repositories, local paths or private projects in anything committed.
-- **A strategy's limits live in its own source**, and are listed in its manifest in the same words. There is no platform policy to defer to, and nothing here should read as if there were.
+- **An agent's limits live in its own source**, and are listed in its manifest in the same words. There is no platform policy to defer to, and nothing here should read as if there were.
 - **The SDK is a version, not a path.** `Cargo.toml` declares `shonin-strategy-sdk` by version; a local checkout is patched in through the gitignored `.cargo/config.toml` that `task patch` writes. Never commit a path dependency.
 - **Dependencies live in the workspace.** Declare every version in `[workspace.dependencies]`; crates use `{ workspace = true }`.
-- **A strategy is reproducible or it is nothing.** `Cargo.lock` is committed and every build is `--locked`: the build service compiles a submission twice and compares the bytes, and a project that does not build the same way twice is refused.
-- **Nothing here holds a key.** A strategy signs nothing and reads no secret it did not declare. If something looks like it needs a key, the design is wrong.
+- **An agent is reproducible or it is nothing.** `Cargo.lock` is committed and every build is `--locked`, so the bundle the build service signs is the one anybody else gets from the same source. Nothing here may read a clock, the network or a random number while it compiles: the reviewer reports that as hidden behaviour and scores the agent down.
+- **Nothing here holds a key.** An agent signs nothing and reads no secret it did not declare. If something looks like it needs a key, the design is wrong.
 
 ## Commit guard
 
