@@ -21,7 +21,7 @@ task test     # native tests
 task dev      # publish funding-basis to a platform running locally
 ```
 
-Copy `.env.example` to `.env` first. Set `SHONIN_PLATFORM_DIR` to a checkout of the platform while the SDK and the strategies are moving together: `task patch` writes a gitignored `.cargo/config.toml` that resolves the SDK from there, and `task dev` runs the platform's own `shonin` command out of that checkout rather than needing it installed. Without it, the SDK resolves from the registry by the version in `Cargo.toml`, which is what the build service does, and `task dev` needs `shonin` on the path.
+Copy `.env.example` to `.env` first, and set `SHONIN_PLATFORM_DIR` to a checkout of the platform. `task patch` writes a gitignored `.cargo/config.toml` that resolves the SDK from there while the SDK and the strategies are moving together; without it, the SDK resolves from the registry by the version in `Cargo.toml`, which is what the build service does. `task dev` (or `task publish AGENT=<name>`) publishes through that checkout, to the platform its `task dev` is running: the platform's seed creates the vault and submits the source, the same flow its web app uses.
 
 ## The agents
 
