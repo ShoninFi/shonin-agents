@@ -11,21 +11,22 @@
 //! never polls and it never sleeps on a timer, so a quiet market costs
 //! nothing.
 //!
-//! Its limits are in this file rather than in a platform policy, because there
-//! is no platform policy. The manifest lists them in the same words, so a
-//! depositor reading the page and a reviewer reading the source are looking at
-//! the same promises.
+//! Its limits are in `config.rs` rather than in a platform policy, because
+//! there is no platform policy. The manifest claims them in the same words, so
+//! a depositor reading the page and a reviewer reading the source are looking
+//! at the same promises.
 
-use agent_shared::{Config, Limits, size_for};
+mod config;
+
 use futures::StreamExt;
 use sdk::{
-    Account, AccountState, Action, Decimal, Order, Side, Verdict, from_payload, to_payload, vault,
-    venues,
+    Account, AccountState, Action, Decimal, Limits, Order, Side, Verdict, decimal, drivers,
+    from_payload, size_for, to_payload, vault,
 };
 use strategy_sdk as sdk;
 
-/// The venue this strategy trades, as its manifest names it.
-const VENUE: &str = "local";
+/// The driver this agent trades through, as its manifest names it.
+const DRIVER: &str = "local";
 
 /// How many steps a halt may take to flatten the book before giving up and
 /// letting the contract finish the job.
@@ -60,23 +61,28 @@ fn zero() -> Decimal {
     Decimal::from(0)
 }
 
+/// The limits in `config.rs`, as numbers.
+fn limits() -> Limits {
+    Limits {
+        max_gross_leverage: decimal(config::MAX_GROSS_LEVERAGE),
+        max_order_fraction: decimal(config::MAX_ORDER_FRACTION),
+        idle_buffer: decimal(config::IDLE_BUFFER),
+        drawdown_stop: decimal(config::DRAWDOWN_STOP),
+    }
+}
+
 impl Mind {
-    fn new(config: &Config) -> Self {
+    fn new() -> Self {
         Self {
             settings: Settings {
-                spot: config.text("market_spot", "BTC"),
-                perp: config.text("market_perp", "BTC-PERP"),
-                entry_funding: config.decimal("entry_funding", "0.0002"),
-                exit_funding: config.decimal("exit_funding", "0.00005"),
-                target_deployment: config.decimal("target_deployment", "0.80"),
-                minimum_notional: config.decimal("minimum_notional", "250"),
+                spot: config::SPOT.to_string(),
+                perp: config::PERP.to_string(),
+                entry_funding: decimal(config::ENTRY_FUNDING),
+                exit_funding: decimal(config::EXIT_FUNDING),
+                target_deployment: decimal(config::TARGET_DEPLOYMENT),
+                minimum_notional: decimal(config::MINIMUM_NOTIONAL),
             },
-            limits: Limits {
-                max_gross_leverage: config.decimal("max_gross_leverage", "2"),
-                max_order_fraction: config.decimal("max_order_fraction", "0.05"),
-                idle_buffer: config.decimal("idle_buffer", "0.05"),
-                drawdown_stop: config.decimal("drawdown_stop", "0.10"),
-            },
+            limits: limits(),
             peak: zero(),
         }
     }
@@ -95,16 +101,15 @@ enum Woke {
     Vault(vault::VaultEvent),
 }
 
-impl sdk::Strategy for FundingBasis {
-    async fn run(config: Vec<u8>) -> Result<(), String> {
-        let config = Config::from_bytes(&config)?;
-        let mut mind = Mind::new(&config);
+impl sdk::Agent for FundingBasis {
+    async fn run() -> Result<(), String> {
+        let mut mind = Mind::new();
 
         // Whatever a previous instance left behind is still on the venue, so
         // look before doing anything.
         step(&mut mind).await?;
 
-        let account = venues::account_events(VENUE)
+        let account = drivers::account_events(DRIVER)
             .into_stream()
             .map(|_| Woke::Venue);
         let vault_events = vault::events().into_stream().map(Woke::Vault);
@@ -140,7 +145,7 @@ async fn step(mind: &mut Mind) -> Result<(), String> {
         state.market(&mind.settings.spot),
         state.market(&mind.settings.perp),
     ) else {
-        // The venue has not listed what the manifest named. Saying nothing is
+        // The venue has not listed what the agent trades. Saying nothing is
         // right: the next event is another chance, and trading something else
         // would not be this strategy.
         return Ok(());
@@ -161,7 +166,7 @@ async fn step(mind: &mut Mind) -> Result<(), String> {
 }
 
 async fn read_state() -> Result<AccountState, String> {
-    from_payload(&venues::account_state(VENUE.to_string(), Vec::new()).await?)
+    from_payload(&drivers::account_state(DRIVER.to_string(), Vec::new()).await?)
 }
 
 /// Add one step's worth of carry, inside every limit the strategy set itself.
@@ -331,49 +336,44 @@ fn cap_by_notional(size: Decimal, price: Decimal, max_notional: Decimal) -> Deci
 /// that stops trading the first time a market moves.
 async fn submit(actions: &[Action]) -> Result<Vec<Verdict>, String> {
     let encoded: Vec<Vec<u8>> = actions.iter().map(to_payload).collect();
-    Ok(venues::submit(VENUE.to_string(), encoded).await)
+    Ok(drivers::submit(DRIVER.to_string(), encoded).await)
 }
 
-sdk::export_strategy!(FundingBasis);
+sdk::export_agent!(FundingBasis);
 
 #[cfg(test)]
 mod tests {
-    use agent_shared::{Limits, size_for};
-    use strategy_sdk::{Decimal, decimal};
+    use super::{config, limits};
+    use strategy_sdk::{decimal, size_for};
 
-    /// The settings this strategy actually ships with, read from its own
-    /// manifest so a test cannot drift from what runs.
-    fn shipped(key: &str) -> Decimal {
-        let manifest = include_str!("../shonin.toml");
-        let line = manifest
-            .lines()
-            .find(|line| line.trim_start().starts_with(&format!("{key} =")))
-            .unwrap_or_else(|| panic!("the manifest declares {key}"));
-        let value = line.split('=').nth(1).expect("a value").trim();
-        value.trim_matches('"').parse().expect("a decimal")
-    }
-
-    /// A strategy whose own per-order cap is below its own minimum order can
+    /// An agent whose own per-order cap is below its own minimum order can
     /// never open a position, and would sit there looking healthy while doing
     /// nothing. The two numbers have to leave room for each other at the size
-    /// a vault this strategy is meant for actually holds.
+    /// a vault this agent is meant for actually holds.
     #[test]
     fn the_shipped_limits_can_open_a_position() {
-        let limits = Limits {
-            max_gross_leverage: shipped("max_gross_leverage"),
-            max_order_fraction: shipped("max_order_fraction"),
-            idle_buffer: shipped("idle_buffer"),
-            drawdown_stop: shipped("drawdown_stop"),
-        };
-        let minimum = shipped("minimum_notional");
+        let minimum = decimal(config::MINIMUM_NOTIONAL);
         let smallest_vault = decimal("2000");
-
-        let wanted = smallest_vault * shipped("target_deployment");
-        let step = size_for(wanted, smallest_vault, decimal("0"), &limits, minimum);
+        let wanted = smallest_vault * decimal(config::TARGET_DEPLOYMENT);
+        let step = size_for(wanted, smallest_vault, decimal("0"), &limits(), minimum);
         assert!(
             step > decimal("0"),
             "a {smallest_vault} vault could not open a position: a step of \
              {step} against a minimum of {minimum}"
         );
+    }
+
+    /// The claims in the manifest are the limits in the code, in words.
+    #[test]
+    fn the_manifest_claims_the_limits_the_code_keeps() {
+        let manifest = include_str!("../shonin.toml");
+        assert!(
+            manifest.contains("at most twice the vault's value")
+                && config::MAX_GROSS_LEVERAGE == "2"
+        );
+        assert!(manifest.contains("above 5% of the vault") && config::MAX_ORDER_FRACTION == "0.05");
+        assert!(manifest.contains("5% of the vault kept liquid") && config::IDLE_BUFFER == "0.05");
+        assert!(manifest.contains("a 10% fall") && config::DRAWDOWN_STOP == "0.10");
+        assert!(manifest.contains(config::SPOT) && manifest.contains(config::PERP));
     }
 }

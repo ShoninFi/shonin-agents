@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["packages/shared", "packages/agents/funding-basis"]
+members = ["packages/agents/funding-basis"]
 
 [workspace.package]
 version = "0.1.0"
@@ -10,10 +10,7 @@ license = "Apache-2.0"
 publish = false
 
 [workspace.dependencies]
-# Local crates
-agent-shared = { path = "packages/shared" }
-
-# The SDK a strategy is written against. It is declared by version, and a
+# The SDK an agent is written against. It is declared by version, and a
 # local checkout is patched in through .cargo/config.toml while both move
 # together; the build service supplies its own pinned copy the same way, so
 # `--locked` holds on both sides.
@@ -29,8 +26,8 @@ unsafe_code = "deny"
 all = { level = "warn", priority = -1 }
 
 [profile.release]
-# A strategy is a component the build service compiles twice and compares, so
-# the profile is part of what makes it reproducible.
+# An agent is a component the build service compiles from source with a
+# pinned recipe, so the profile is part of what makes it reproducible.
 opt-level = "s"
 lto = true
 codegen-units = 1

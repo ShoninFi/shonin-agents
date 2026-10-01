@@ -5,10 +5,10 @@ The reference agents: WASM components compiled from this repository and publishe
 ## Rules
 
 - **This repository is public.** Never mention other repositories, local paths or private projects in anything committed.
-- **An agent's limits live in its own source**, and are listed in its manifest in the same words. There is no platform policy to defer to, and nothing here should read as if there were.
+- **An agent's limits live in its own source**, as constants in `src/config.rs`, and are claimed in its manifest in the same words. There is no platform policy to defer to, and nothing here should read as if there were.
 - **The SDK is a version, not a path.** `Cargo.toml` declares `shonin-strategy-sdk` by version; a local checkout is patched in through the gitignored `.cargo/config.toml` that `task patch` writes. Never commit a path dependency.
 - **Dependencies live in the workspace.** Declare every version in `[workspace.dependencies]`; crates use `{ workspace = true }`.
-- **An agent is reproducible or it is nothing.** `Cargo.lock` is committed and every build is `--locked`, so the bundle the build service signs is the one anybody else gets from the same source. Nothing here may read a clock, the network or a random number while it compiles: the reviewer reports that as hidden behaviour and scores the agent down.
+- **An agent is reproducible or it is nothing.** `Cargo.lock` is committed and every build is `--locked`, so the bundle the build service signs is the one anybody else gets from the same source. Nothing here may read a clock, the network or a random number while it compiles: the reviewer reports that against the agent's reproducibility rating.
 - **Nothing here holds a key.** An agent signs nothing and reads no secret it did not declare. If something looks like it needs a key, the design is wrong.
 
 ## Commit guard

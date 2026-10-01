@@ -1,12 +1,12 @@
 # Shonin Agents
 
-The reference strategies. Each one is a WASM component compiled from the Rust in this repository, published to a Shonin platform, and run by an attested executor that alone holds its vault's keys.
+The reference agents. Each one is a WASM component compiled from the Rust in this repository, published to a Shonin platform, and run by an attested executor that alone holds its vault's keys.
 
-A strategy here is an ordinary Rust library that implements one long-lived async function. It holds no key, signs nothing, and reaches the outside world only through the imports the `shonin:strategy` world gives it. Whatever it decides, it can only ever trade its vault's own accounts.
+An agent here is an ordinary Rust library that implements one long-lived async function. It holds no key, signs nothing, and reaches the outside world only through the imports the `shonin:agent` world gives it. Whatever it decides, it can only ever trade its vault's own accounts.
 
 ## Prerequisites
 
-- [Rust](https://rustup.rs). The toolchain is pinned in `rust-toolchain.toml`, with the `wasm32-wasip2` target a strategy compiles to.
+- [Rust](https://rustup.rs). The toolchain is pinned in `rust-toolchain.toml`, with the `wasm32-wasip2` target an agent compiles to.
 - [Task](https://taskfile.dev)
 - For the commit guard: [gitleaks](https://github.com/gitleaks/gitleaks), [jq](https://jqlang.org) and the [Claude Code](https://claude.com/claude-code) CLI.
 
@@ -21,7 +21,7 @@ task test     # native tests
 task dev      # publish funding-basis to a platform running locally
 ```
 
-Copy `.env.example` to `.env` first, and set `SHONIN_PLATFORM_DIR` to a checkout of the platform. `task patch` writes a gitignored `.cargo/config.toml` that resolves the SDK from there while the SDK and the strategies are moving together; without it, the SDK resolves from the registry by the version in `Cargo.toml`, which is what the build service does. `task dev` (or `task publish AGENT=<name>`) publishes through that checkout, to the platform its `task dev` is running: the platform's seed creates the vault and submits the source, the same flow its web app uses.
+Copy `.env.example` to `.env` first, and set `SHONIN_PLATFORM_DIR` to a checkout of the platform. `task patch` writes a gitignored `.cargo/config.toml` that resolves the SDK from there while the SDK and the agents are moving together; without it, the SDK resolves from the registry by the version in `Cargo.toml`, which is what the build service does. `task dev` (or `task publish AGENT=<name>`) publishes through that checkout, to the platform its `task dev` is running: the platform's seed uploads the source, pays to publish it, and activates it once it is reviewed and built, the same flow its web app uses.
 
 ## The agents
 
@@ -33,15 +33,14 @@ Copy `.env.example` to `.env` first, and set `SHONIN_PLATFORM_DIR` to a checkout
 
 ```text
 packages/
-  shared/                helpers every agent shares: reading its config, sizing a position
-  agents/funding-basis/  the agent: its manifest, and the code the reviewer reads
+  agents/funding-basis/  the agent: its manifest, its settings in src/config.rs, and the code the reviewer reads
 ```
 
-Each agent is a directory with a `Cargo.toml`, a `shonin.toml` and its source. The manifest is what the author declares: what the strategy is, the limits it sets itself, the venues and accounts it trades, and the compute it asks for. The platform hashes it, and a vault's page shows what it said.
+Each agent is a directory with a `Cargo.toml`, a `shonin.toml` and its source. The manifest only declares, for the platform: the chain its vault lives on, the author's description and claims, and the drivers it trades through. Its own settings are constants in `src/config.rs`, and its allowances are set on the vault when it is activated. The platform hashes the manifest, and a vault's page shows what it said.
 
 ## Limits live in the code
 
-There is no platform risk policy, and there is nothing to configure that would add one. A strategy's limits are written in its own source, listed in its manifest in the same words, and read by the reviewer. A depositor comparing the page against the code is comparing two descriptions of one thing.
+There is no platform risk policy, and there is nothing to configure that would add one. An agent's limits are written in its own source, claimed in its manifest in the same words, and checked against the code by the reviewer. A depositor comparing the page against the code is comparing two descriptions of one thing.
 
 ## License
 
