@@ -16,7 +16,7 @@ and a larger vault should expect less.
 claims = [
     "Gross exposure at most twice the vault's value",
     "No single order above 5% of the vault",
-    "5% of the vault kept liquid, so an ordinary withdrawal closes nothing",
+    "6% of the vault kept liquid, so an ordinary withdrawal closes nothing",
     "Only reduces after a 10% fall from the vault's peak",
     "One market, BTC against BTC-PERP, and nothing else",
 ]

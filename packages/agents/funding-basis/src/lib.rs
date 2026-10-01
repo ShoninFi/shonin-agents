@@ -132,7 +132,10 @@ impl sdk::Agent for FundingBasis {
                         chain: transfers::home_chain(),
                         driver: DRIVER.to_string(),
                     });
-                    transfers::move_(venue, Account::Vault, short).await?;
+                    // As much as the venue will let go of: a refusal leaves
+                    // the claim to the contract, which closes the fraction
+                    // itself.
+                    let _ = transfers::move_(venue, Account::Vault, short).await;
                     step(&mut mind).await?
                 }
                 // Unwind rather than be unwound.
@@ -224,7 +227,14 @@ async fn open_one_step(
             chain: transfers::home_chain(),
             driver: DRIVER.to_string(),
         });
-        transfers::move_(Account::Vault, venue, millionths(moving)).await?;
+        // The vault holds its idle floor however much is asked for; a move
+        // it refuses means trading with what is already there.
+        if transfers::move_(Account::Vault, venue, millionths(moving))
+            .await
+            .is_err()
+        {
+            return Ok(());
+        }
     }
 
     // Both legs in one submission. A filled long beside an unfilled short is
