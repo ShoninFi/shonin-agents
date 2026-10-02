@@ -19,9 +19,10 @@
 mod config;
 
 use futures::StreamExt;
+use sdk::transfers::{self, Account, VenueAccount};
 use sdk::{
-    Account, AccountState, Action, Decimal, Limits, Order, Side, Verdict, decimal, drivers,
-    from_payload, size_for, to_payload, vault,
+    AccountState, Action, Decimal, Limits, Order, Side, Verdict, decimal, drivers, from_payload,
+    millionths, size_for, to_payload, vault,
 };
 use strategy_sdk as sdk;
 
@@ -123,6 +124,20 @@ impl sdk::Agent for FundingBasis {
                 // fraction of both legs together. Nothing to do but let it,
                 // then rebalance what is left.
                 Woke::Vault(vault::VaultEvent::ClaimPending(_)) => step(&mut mind).await?,
+                // Leavers are waiting on more cash than the vault holds:
+                // bring the shortfall home from the venue, so they are paid
+                // without waiting for a claim.
+                Woke::Vault(vault::VaultEvent::BufferLow(short)) => {
+                    let venue = Account::Venue(VenueAccount {
+                        chain: transfers::home_chain(),
+                        driver: DRIVER.to_string(),
+                    });
+                    // As much as the venue will let go of: a refusal leaves
+                    // the claim to the contract, which closes the fraction
+                    // itself.
+                    let _ = transfers::move_(venue, Account::Vault, short).await;
+                    step(&mut mind).await?
+                }
                 // Unwind rather than be unwound.
                 Woke::Vault(vault::VaultEvent::Halting(_)) => {
                     flatten(&mind).await?;
@@ -206,12 +221,20 @@ async fn open_one_step(
     };
     if spare > zero() {
         let moving = if notional < spare { notional } else { spare };
-        submit(&[Action::MoveCapital {
-            from: Account::Idle,
-            to: Account::Venue,
-            amount: moving,
-        }])
-        .await?;
+        // From the vault's cash, through its station, into the venue
+        // account the station owns.
+        let venue = Account::Venue(VenueAccount {
+            chain: transfers::home_chain(),
+            driver: DRIVER.to_string(),
+        });
+        // The vault holds its idle floor however much is asked for; a move
+        // it refuses means trading with what is already there.
+        if transfers::move_(Account::Vault, venue, millionths(moving))
+            .await
+            .is_err()
+        {
+            return Ok(());
+        }
     }
 
     // Both legs in one submission. A filled long beside an unfilled short is

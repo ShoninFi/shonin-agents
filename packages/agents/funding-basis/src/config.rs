@@ -21,7 +21,8 @@ pub const MINIMUM_NOTIONAL: &str = "100";
 pub const MAX_GROSS_LEVERAGE: &str = "2";
 /// No single order above 5% of the vault.
 pub const MAX_ORDER_FRACTION: &str = "0.05";
-/// 5% of the vault kept liquid, so an ordinary withdrawal closes nothing.
-pub const IDLE_BUFFER: &str = "0.05";
+/// 6% of the vault kept liquid, so an ordinary withdrawal closes nothing:
+/// a little above the vault's own 5% idle floor, which it never moves past.
+pub const IDLE_BUFFER: &str = "0.06";
 /// Only reduces after a 10% fall from the vault's peak.
 pub const DRAWDOWN_STOP: &str = "0.10";
