@@ -19,7 +19,7 @@
 mod config;
 
 use futures::StreamExt;
-use sdk::transfers::{self, Account, VenueAccount};
+use sdk::transfers::{self, Account, Moved, VenueAccount};
 use sdk::{
     AccountState, Action, Decimal, Limits, Order, Side, Verdict, decimal, drivers, from_payload,
     millionths, size_for, to_payload, vault,
@@ -227,12 +227,14 @@ async fn open_one_step(
             chain: transfers::home_chain(),
             driver: DRIVER.to_string(),
         });
-        // The vault holds its idle floor however much is asked for; a move
-        // it refuses means trading with what is already there.
-        if transfers::move_(Account::Vault, venue, millionths(moving))
-            .await
-            .is_err()
-        {
+        // The vault holds its idle floor however much is asked for. A move
+        // it refuses, one that stopped in the station on the way, or one
+        // whose fate is unknown means trading with what is already there
+        // once the next event says what arrived.
+        if !matches!(
+            transfers::move_(Account::Vault, venue, millionths(moving)).await,
+            Moved::Done
+        ) {
             return Ok(());
         }
     }
@@ -395,7 +397,7 @@ mod tests {
                 && config::MAX_GROSS_LEVERAGE == "2"
         );
         assert!(manifest.contains("above 5% of the vault") && config::MAX_ORDER_FRACTION == "0.05");
-        assert!(manifest.contains("5% of the vault kept liquid") && config::IDLE_BUFFER == "0.05");
+        assert!(manifest.contains("6% of the vault kept liquid") && config::IDLE_BUFFER == "0.06");
         assert!(manifest.contains("a 10% fall") && config::DRAWDOWN_STOP == "0.10");
         assert!(manifest.contains(config::SPOT) && manifest.contains(config::PERP));
     }
