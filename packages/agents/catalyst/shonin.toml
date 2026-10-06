@@ -1,0 +1,30 @@
+# Reads filings from the SEC over HTTPS.
+capabilities = ["network"]
+
+[vault]
+chain = "robinhood"
+
+[description]
+title = "Catalyst"
+text = """
+Reads the filings companies make with the US Securities and Exchange \
+Commission as they are published, scores each new current report (a Form \
+8-K: results, agreements, departures, restatements) with a model, and takes \
+a small, bounded position in the company's stock token when the score is \
+strong, closing it on a timer or a stop.
+
+Its model is a placeholder: a fixed linear score of which items a report \
+carries, written down in its source, not a model trained on anything. It \
+is here to show the shape of the strategy and what bounds it, and its \
+record will say how little a placeholder knows. Filings are public and \
+free to read; nothing it reads is licensed or paid for.
+"""
+claims = [
+    "Reads only the SEC's public filings for three companies: NVDA, TSLA and AAPL",
+    "Long only: buys a stock token on a strong score and sells it later",
+    "No single order above 5% of the vault, and at most 30% of the vault in positions",
+    "Each position closed after a day, or sooner after a 3% fall from its entry",
+    "6% of the vault kept liquid, so an ordinary withdrawal closes nothing",
+]
+
+[drivers.robinhood]

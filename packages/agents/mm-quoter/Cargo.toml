@@ -1,0 +1,18 @@
+[package]
+name = "mm-quoter"
+description = "Quotes both sides of a few Hyperliquid perpetuals and manages the inventory it takes on"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+futures.workspace = true
+shonin-strategy-sdk.workspace = true
+
+[lints]
+workspace = true

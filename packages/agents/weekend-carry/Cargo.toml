@@ -1,0 +1,19 @@
+[package]
+name = "weekend-carry"
+description = "Holds Robinhood stock tokens against Lighter perpetuals over the weekend, when nothing pins the token to its stock"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+futures.workspace = true
+serde.workspace = true
+shonin-strategy-sdk.workspace = true
+
+[lints]
+workspace = true
