@@ -1,0 +1,30 @@
+[vault]
+chain = "robinhood"
+
+[description]
+title = "Weekend carry"
+text = """
+Robinhood's stock tokens trade all weekend, but the stock market behind them \
+and the channel that creates and redeems them do not. From Friday evening to \
+Monday's open nothing pulls a token back to its stock, and the perpetual on \
+the same stock drifts with the weekend's flow. When the perpetual trades \
+above the token, this agent holds the token and shorts the perpetual in \
+equal shares, and carries the pair into Monday, when the gap usually closes.
+
+The position has no view on the stock: the token and the short move \
+together. What can go wrong is the gap widening before it closes, funding \
+turning against the short, and a weekend market too thin to leave at a \
+good price; the limits below are what bound it.
+"""
+claims = [
+    "Gross exposure at most twice the vault's value",
+    "No single order above 5% of the vault",
+    "Three underlyings only: SPY, QQQ and NVDA, as stock tokens and as Lighter perpetuals",
+    "Both legs cut together after a 10% fall from the vault's peak",
+    "Unwinds the perpetual first and the token second, never leaving a naked short",
+    "6% of the vault kept liquid, so an ordinary withdrawal closes nothing",
+]
+
+[drivers.robinhood]
+
+[drivers.lighter]
