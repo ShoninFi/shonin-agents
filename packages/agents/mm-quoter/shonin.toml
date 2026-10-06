@@ -7,9 +7,11 @@ text = """
 Quotes both sides of one Hyperliquid perpetual, resting orders only, and \
 earns the spread between them. It leans its quotes against whatever \
 inventory it has taken on, so it is paid to come back to flat, and it stops \
-adding to a side once that side's inventory reaches its cap. Every quote it \
-posts is cancelled by the venue itself within seconds unless the agent \
-renews it, so an agent that stops leaves nothing resting.
+adding to a side once that side's inventory reaches its cap. The venue \
+itself cancels every quote within 60 seconds of the agent falling silent. \
+The venue does that at most ten times a day (UTC), so after eight such \
+cancels in a day the agent pulls its quotes and stops quoting until the \
+next day. Its count starts again if the agent is restarted.
 
 Market making earns most where it is largest: the record shows the size \
 every return was earned at.
@@ -18,7 +20,7 @@ claims = [
     "Resting quotes only, except when the vault halts and it closes its inventory",
     "Inventory at most 50% of the vault's value",
     "Each quote at most 2% of the vault's value",
-    "Every quote cancelled by the venue unless renewed within 15 seconds",
+    "Every quote cancelled by the venue within 60 seconds of the agent falling silent, at most ten times a day; after eight in a day it stops quoting until the next",
     "One market, the ETH perpetual, at cross margin and leverage 3",
 ]
 
