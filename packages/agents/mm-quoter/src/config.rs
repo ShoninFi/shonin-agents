@@ -14,8 +14,22 @@ pub const HALF_SPREAD: &str = "0.0008";
 pub const SKEW_AT_CAP: &str = "0.0010";
 /// Quotes are renewed when the mid moves this far from where they were set.
 pub const REQUOTE_MOVE: &str = "0.0004";
-/// The venue cancels every quote this long after it was last renewed.
-pub const DEAD_MAN_MS: u64 = 15_000;
+/// The venue's own cancel-everything deadline is set this far ahead of the
+/// agent's clock: if the agent stops renewing it, the venue cancels every
+/// quote at most this long after the last renewal.
+pub const DEAD_MAN_MS: u64 = 60_000;
+/// The deadline is renewed once less than this is left on it, so it is sent
+/// at most about twice a minute however often the quotes move, rather than
+/// with every requote: each renewal is an action the venue counts against
+/// the account's request allowance.
+pub const RENEW_WHEN_LEFT_MS: u64 = 30_000;
+/// The venue fires a scheduled cancel at most ten times a UTC day. Once the
+/// deadline has run out this many times in a day (each time the agent fell
+/// silent), the agent stops quoting until the next UTC day, so it never
+/// rests a quote without the venue's deadline behind it.
+pub const STOP_AFTER_FIRES: u32 = 8;
+// Always some of the venue's ten left over.
+const _: () = assert!(STOP_AFTER_FIRES < 10);
 
 /// Each quote at most 2% of the vault's value.
 pub const QUOTE_FRACTION: &str = "0.02";
