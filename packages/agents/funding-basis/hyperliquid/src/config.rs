@@ -15,6 +15,12 @@ pub const SPOT_SIZE_DECIMALS: u32 = 2;
 /// The perpetual shorted against it, and its size decimals.
 pub const PERP: &str = "HYPE";
 pub const PERP_SIZE_DECIMALS: u32 = 2;
+/// The HYPE the account keeps for its sends home, which the strategy never
+/// sells. Every send of dollars from HyperCore back to the vault costs the
+/// account a little HYPE, and the executor buys it from the account's own
+/// dollars, never past one HYPE in all. The strategy can't tell that HYPE
+/// from its own spot leg, so it leaves the most the executor may hold.
+pub const HYPE_KEPT_FOR_SENDS_HOME: &str = "1";
 /// The leverage the perp leg is held at: cross margin, and low, since the
 /// spot leg is the hedge and the perp only needs to survive the basis.
 pub const PERP_LEVERAGE: u32 = 2;
@@ -30,6 +36,10 @@ pub const TARGET_DEPLOYMENT: &str = "0.80";
 pub const MINIMUM_NOTIONAL: &str = "100";
 /// How far past the best price an immediate order may reach, as a fraction.
 pub const SLIPPAGE: &str = "0.002";
+/// How far short of its target the carry, or the money behind it at the
+/// venue, may fall before anything is done about it, as a fraction of the
+/// target. Drift inside it is not worth the transactions it would take.
+pub const REBALANCE_BAND: &str = "0.10";
 
 /// Gross exposure at most twice the vault's value.
 pub const MAX_GROSS_LEVERAGE: &str = "2";
