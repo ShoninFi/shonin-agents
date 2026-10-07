@@ -16,6 +16,15 @@ pub const EXIT_FUNDING: &str = "0.00005";
 pub const TARGET_DEPLOYMENT: &str = "0.80";
 /// Below this, an order is not worth the spread it would pay.
 pub const MINIMUM_NOTIONAL: &str = "100";
+/// How far past the quoted price an order may fill, as a fraction. The
+/// market moves between reading a price and the order landing; an order held
+/// to the exact quote misses whenever it does, and a miss costs as much gas
+/// as a fill.
+pub const SLIPPAGE: &str = "0.002";
+/// How far short of its target the carry, or the money behind it at the
+/// venue, may fall before anything is done about it, as a fraction of the
+/// target. Drift inside it is not worth the transactions it would take.
+pub const REBALANCE_BAND: &str = "0.10";
 
 /// Gross exposure at most twice the vault's value.
 pub const MAX_GROSS_LEVERAGE: &str = "2";

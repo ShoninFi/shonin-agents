@@ -8,18 +8,21 @@
 //!
 //! Prices and funding come from Shonin's shared Hyperliquid stream; the
 //! account comes from the driver. The agent keeps the latest book of each
-//! leg as they arrive, and takes one step towards what it wants to hold each
-//! time funding changes or its account does. It never polls.
+//! leg as they arrive, and takes one step towards what it wants to hold when
+//! funding crosses a threshold or its account changes, if that step is worth
+//! doing (`decide.rs` says when it is). It never polls.
 
 mod config;
+mod decide;
 
+use decide::{
+    Leavers, Patience, Plan, Quotes, Snapshot, Top, hedge, held, limits, spot_dollars, trim, unwind,
+};
 use futures::StreamExt;
-use hl::{AccountState, Action, Balance, Order, Side, Tif};
+use hl::{AccountState, Action, Balance, Order, Receipt, Side};
 use sdk::streams::{self, HYPERLIQUID, HyperliquidFeed, HyperliquidValue};
 use sdk::transfers::{self, Account, Moved, VenueAccount};
-use sdk::{
-    Decimal, Limits, decimal, drivers, from_payload, millionths, size_for, to_payload, vault,
-};
+use sdk::{Decimal, Limits, drivers, from_payload, millionths, to_payload, vault};
 use strategy_sdk as sdk;
 use strategy_sdk::hyperliquid as hl;
 
@@ -30,62 +33,50 @@ const DRIVER: &str = hl::DRIVER;
 /// rest to the contract.
 const FLATTEN_STEPS: usize = 32;
 
-struct FundingBasis;
+/// How many perpetual orders one step may send to level the short with the
+/// spot. One is almost always enough; more are for a gap wider than the
+/// order cap, or an order that only partly filled.
+const HEDGE_ORDERS: usize = 8;
 
-/// The best bid and ask of one leg, as last heard.
-#[derive(Clone, Copy, Default)]
-struct Top {
-    bid: Option<Decimal>,
-    ask: Option<Decimal>,
-}
+struct FundingBasis;
 
 /// What the strategy knows. Rebuilt from the venue and the stream whenever
 /// it starts, so losing it to a restart costs a moment and nothing else.
 struct Mind {
     limits: Limits,
-    spot: Top,
-    perp: Top,
-    /// Funding, as a fraction of notional per day.
-    funding: Option<Decimal>,
+    quotes: Quotes,
     /// The most the vault has been worth while this instance watched it.
     peak: Decimal,
     /// Whether the perp's leverage has been set since this instance began.
     levered: bool,
-}
-
-fn zero() -> Decimal {
-    Decimal::from(0)
-}
-
-fn limits() -> Limits {
-    Limits {
-        max_gross_leverage: decimal(config::MAX_GROSS_LEVERAGE),
-        max_order_fraction: decimal(config::MAX_ORDER_FRACTION),
-        idle_buffer: decimal(config::IDLE_BUFFER),
-        drawdown_stop: decimal(config::DRAWDOWN_STOP),
-    }
+    /// Whether the last look found something to do, so the next funding
+    /// update is worth another.
+    busy: bool,
+    /// How long to leave a plan the venue or the station refused.
+    patience: Patience,
+    /// The vault's cash that leavers are waiting on. Lost to a restart, which
+    /// at worst sends it out once more for the next `buffer-low` to bring
+    /// back.
+    leavers: Leavers,
 }
 
 impl Mind {
     fn new() -> Self {
         Self {
             limits: limits(),
-            spot: Top::default(),
-            perp: Top::default(),
-            funding: None,
-            peak: zero(),
+            quotes: Quotes::default(),
+            peak: decide::zero(),
             levered: false,
+            busy: false,
+            patience: Patience::default(),
+            leavers: Leavers::default(),
         }
-    }
-
-    fn only_reducing(&self, value: Decimal) -> bool {
-        self.peak > zero() && (self.peak - value) / self.peak >= self.limits.drawdown_stop
     }
 }
 
 /// What woke the strategy up.
 enum Woke {
-    Venue,
+    Venue(Vec<u8>),
     Vault(vault::VaultEvent),
     SpotBook(Top),
     PerpBook(Top),
@@ -136,7 +127,7 @@ impl sdk::Agent for FundingBasis {
         });
         let account = drivers::account_events(DRIVER)
             .into_stream()
-            .map(|_| Woke::Venue);
+            .map(Woke::Venue);
         let vault_events = vault::events().into_stream().map(Woke::Vault);
 
         let mut waking = futures::stream::select_all([
@@ -151,23 +142,32 @@ impl sdk::Agent for FundingBasis {
             match woke {
                 // Prices only update what the agent knows; it acts when
                 // funding or its account moves, not on every quote.
-                Woke::SpotBook(top) => mind.spot = top,
-                Woke::PerpBook(top) => mind.perp = top,
+                Woke::SpotBook(top) => mind.quotes.spot = top,
+                Woke::PerpBook(top) => mind.quotes.perp = top,
+                // Funding arrives every few seconds. It is looked at when it
+                // crosses a threshold, or while there is still something to
+                // do; otherwise the account's own events (fills, the hourly
+                // funding payment) are what wake the strategy.
                 Woke::Funding(daily) => {
-                    mind.funding = Some(daily);
-                    step(&mut mind).await?;
+                    let before = mind.quotes.funding.replace(daily);
+                    if decide::steps_on_funding(before, daily, mind.busy) {
+                        step(&mut mind, false).await?;
+                    }
                 }
-                Woke::Venue | Woke::Vault(vault::VaultEvent::ClaimPending(_)) => {
-                    step(&mut mind).await?
+                Woke::Venue(event) => {
+                    if decide::wakes_for(&event) {
+                        step(&mut mind, false).await?
+                    }
                 }
+                Woke::Vault(vault::VaultEvent::ClaimPending(_)) => step(&mut mind, false).await?,
                 Woke::Vault(vault::VaultEvent::BufferLow(short)) => {
                     // As much as the venue will let go of; a claim's close
                     // covers whatever this doesn't.
                     let _ = transfers::move_(venue(), Account::Vault, short).await;
-                    step(&mut mind).await?
+                    step(&mut mind, true).await?
                 }
                 Woke::Vault(vault::VaultEvent::Halting(_)) => {
-                    flatten(&mind).await?;
+                    flatten(&mut mind).await?;
                     return Ok(());
                 }
                 Woke::Nothing => {}
@@ -184,48 +184,42 @@ fn venue() -> Account {
     })
 }
 
-/// The legs as the account holds them: spot tokens, and the perp position
-/// (negative when short).
-fn held(state: &AccountState) -> (Decimal, Decimal) {
-    let spot = state
-        .spot
-        .iter()
-        .find(|balance| balance.token == config::SPOT_TOKEN)
-        .map_or_else(zero, |balance| balance.total);
-    let perp = state
-        .positions
-        .iter()
-        .find(|position| position.market == config::PERP)
-        .map_or_else(zero, |position| position.size);
-    (spot, perp)
-}
-
-fn spot_dollars(state: &AccountState) -> Decimal {
-    state
-        .spot
-        .iter()
-        .find(|balance| balance.token == "USDC")
-        .map_or_else(zero, |balance| balance.total - balance.hold)
-}
-
-/// Look at what is there, work out what should be there, and take one step.
-async fn step(mind: &mut Mind) -> Result<(), String> {
+/// Look at what is there, work out what should be there, and act on it if
+/// that is worth doing. `brought_home` says cash has just come home for
+/// leavers.
+async fn step(mind: &mut Mind, brought_home: bool) -> Result<(), String> {
     let state = read_state().await?;
     if state.vault_value > mind.peak {
         mind.peak = state.vault_value;
     }
-    let Some(funding) = mind.funding else {
-        return Ok(());
-    };
-    let (spot, perp) = held(&state);
-    let carrying = spot > zero() && perp < zero();
-    let reducing = mind.only_reducing(state.vault_value);
-
-    if carrying && (funding < decimal(config::EXIT_FUNDING) || reducing) {
-        return unwind_one_step(mind, &state, mind.limits.max_order_fraction).await;
+    if brought_home {
+        mind.leavers.brought_home(&mind.limits, &state);
+    } else {
+        mind.leavers.seen(state.idle);
     }
-    if funding >= decimal(config::ENTRY_FUNDING) && !reducing {
-        return open_one_step(mind, &state).await;
+    let plan = decide::decide(
+        &mind.limits,
+        mind.peak,
+        mind.leavers.held(),
+        &state,
+        &mind.quotes,
+    );
+    mind.busy = plan != Plan::Nothing;
+    if !mind.busy {
+        return Ok(());
+    }
+    let at = Snapshot::of(&state);
+    if mind.patience.holds_back(&at) {
+        return Ok(());
+    }
+    if let Plan::Build { fund, .. } = &plan {
+        mind.leavers.taken(fund.from_vault);
+    }
+    let limits = mind.limits;
+    if carry_out(mind, &limits, &state, &plan).await? {
+        mind.patience.went_through();
+    } else {
+        mind.patience.refused(at);
     }
     Ok(())
 }
@@ -234,200 +228,139 @@ async fn read_state() -> Result<AccountState, String> {
     from_payload(&drivers::account_state(DRIVER.to_string(), Vec::new()).await?)
 }
 
-/// `size` rounded down to `decimals` places.
-fn round_down(size: Decimal, decimals: u32) -> Decimal {
-    let scale = Decimal::from(10u64.pow(decimals));
-    (size * scale).floor() / scale
-}
-
-/// Add one step's worth of carry, inside every limit the strategy set.
-async fn open_one_step(mind: &mut Mind, state: &AccountState) -> Result<(), String> {
-    let (Some(spot_ask), Some(perp_bid)) = (mind.spot.ask, mind.perp.bid) else {
-        return Ok(());
-    };
-    if spot_ask <= zero() || perp_bid <= zero() {
-        return Ok(());
-    }
-    let (spot, perp) = held(state);
-    let gross = spot * spot_ask + (zero() - perp) * perp_bid;
-    let working = state.vault_value * decimal(config::TARGET_DEPLOYMENT);
-    let wanted = if working > gross {
-        working - gross
-    } else {
-        zero()
-    };
-    let notional = size_for(
-        wanted,
-        state.vault_value,
-        gross,
-        &mind.limits,
-        decimal(config::MINIMUM_NOTIONAL),
-    );
-    if notional <= zero() {
-        return Ok(());
-    }
-
-    // The money has to be at the venue before it can trade; the buffer
-    // stays in the vault, where a withdrawal reaches it without a close.
-    let keep = state.vault_value * mind.limits.idle_buffer;
-    let spare = if state.idle > keep {
-        state.idle - keep
-    } else {
-        zero()
-    };
-    if spare > zero() {
-        let moving = if notional < spare { notional } else { spare };
-        if !matches!(
-            transfers::move_(Account::Vault, venue(), millionths(moving)).await,
-            Moved::Done
-        ) {
-            return Ok(());
-        }
-    }
-
-    // The spot leg is paid for from the account's spot dollars; the perp
-    // leg's margin stays on the perp side.
-    let spot_cash = spot_dollars(state);
-    if spot_cash < notional {
-        let moving = round_down(notional - spot_cash, 2);
-        let verdicts = submit(&[Action::MoveDollars {
-            from: Balance::Perp,
-            amount: moving,
-        }])
-        .await?;
-        if !matches!(verdicts.first(), Some(sdk::Verdict::Accepted(_))) {
-            return Ok(());
-        }
-    }
-    if !mind.levered {
-        let verdicts = submit(&[Action::Leverage {
-            market: config::PERP.into(),
-            leverage: config::PERP_LEVERAGE,
-        }])
-        .await?;
-        mind.levered = matches!(verdicts.first(), Some(sdk::Verdict::Accepted(_)));
-    }
-
-    let slip = decimal(config::SLIPPAGE);
-    let spot_size = round_down(notional / spot_ask, config::SPOT_SIZE_DECIMALS);
-    let perp_size = round_down(notional / perp_bid, config::PERP_SIZE_DECIMALS);
-    if spot_size <= zero() || perp_size <= zero() {
-        return Ok(());
-    }
-    // The spot first: an unfilled spot beside a filled short is a short, so
-    // the short is sized to what the spot actually bought, on the next step.
-    submit(&[
-        Action::Place(order(
-            config::SPOT,
-            Side::Buy,
-            spot_size,
-            spot_ask * (Decimal::from(1) + slip),
-            false,
-        )),
-        Action::Place(order(
-            config::PERP,
-            Side::Sell,
-            perp_size.min(round_down(spot + spot_size, config::PERP_SIZE_DECIMALS) + perp),
-            perp_bid * (Decimal::from(1) - slip),
-            false,
-        )),
-    ])
-    .await
-    .map(|_| ())
-}
-
-/// An immediate-or-cancel order, its limit written as the venue takes it.
-fn order(market: &str, side: Side, size: Decimal, limit: Decimal, reduce_only: bool) -> Order {
-    Order {
-        market: market.to_string(),
-        side,
-        size,
-        limit_price: five_figures(limit, side),
-        tif: Tif::Ioc,
-        reduce_only,
-        client_id: None,
-    }
-}
-
-/// A price at five significant figures, the most the venue takes, rounded
-/// away from the market (down for a buy, up for a sell) so it never reaches
-/// further than meant.
-fn five_figures(price: Decimal, side: Side) -> Decimal {
-    if price <= zero() {
-        return price;
-    }
-    let mut scale = Decimal::from(1);
-    let ten = Decimal::from(10);
-    while price * scale < Decimal::from(10_000) {
-        scale *= ten;
-    }
-    while price * scale >= Decimal::from(100_000) {
-        scale /= ten;
-    }
-    let scaled = price * scale;
-    let rounded = match side {
-        Side::Buy => scaled.floor(),
-        Side::Sell => scaled.ceil(),
-    };
-    rounded / scale
-}
-
-/// Take one step out of the carry: the perp first, then the spot.
-async fn unwind_one_step(
-    mind: &Mind,
+/// Do what `plan` says, and say whether any of it went through.
+///
+/// The spot goes first and the short is sized to what it actually bought,
+/// so an unfilled spot never leaves a short on its own, and the short is
+/// levelled with the whole of the spot, an order's worth at a time, before
+/// the step ends; on the way out the short goes first and the spot follows
+/// what was bought back.
+async fn carry_out(
+    mind: &mut Mind,
+    limits: &Limits,
     state: &AccountState,
-    order_fraction: Decimal,
-) -> Result<(), String> {
-    let (spot, perp) = held(state);
-    let per_order = state.vault_value * order_fraction;
-    let slip = decimal(config::SLIPPAGE);
-    let mut actions = Vec::new();
-    if let Some(ask) = mind.perp.ask.filter(|ask| *ask > zero() && perp < zero()) {
-        let size = round_down(
-            (zero() - perp).min(per_order / ask),
-            config::PERP_SIZE_DECIMALS,
-        );
-        if size > zero() {
-            actions.push(Action::Place(order(
-                config::PERP,
-                Side::Buy,
-                size,
-                ask * (Decimal::from(1) + slip),
-                true,
-            )));
+    plan: &Plan,
+) -> Result<bool, String> {
+    let mut landed = false;
+    match plan {
+        Plan::Nothing => {}
+        Plan::Build { fund, spot } => {
+            // The money has to be at the venue before it can trade: the
+            // station's idle dollars first, then the vault's cash; the
+            // buffer stays in the vault, where a withdrawal reaches it
+            // without a close. A move that stopped in the station, or whose
+            // fate is unknown, is counted as outside the vault from then on,
+            // so it is never sent twice.
+            let home = transfers::home_chain();
+            for (from, amount) in [
+                (Account::Station(home), fund.from_station),
+                (Account::Vault, fund.from_vault),
+            ] {
+                if amount > decide::zero() {
+                    match transfers::move_(from, venue(), millionths(amount)).await {
+                        Moved::Done => landed = true,
+                        Moved::Partial(_) => return Ok(true),
+                        Moved::Refused(_) | Moved::Unknown(_) => return Ok(landed),
+                    }
+                }
+            }
+            let (mut spot_held, mut perp_held) = held(state);
+            if let Some(order) = spot {
+                // The spot leg is paid for from the account's spot dollars;
+                // the perp leg's margin stays on the perp side.
+                let cost = order.size * order.limit_price;
+                let spot_cash = spot_dollars(state);
+                if spot_cash < cost {
+                    let verdicts = submit(&[Action::MoveDollars {
+                        from: Balance::Perp,
+                        amount: decide::round_up_cents(cost - spot_cash),
+                    }])
+                    .await?;
+                    if !matches!(verdicts.first(), Some(sdk::Verdict::Accepted(_))) {
+                        return Ok(landed);
+                    }
+                }
+                match place(order).await? {
+                    Some(size) => {
+                        landed = true;
+                        spot_held += size;
+                    }
+                    None => return Ok(landed),
+                }
+            }
+            for _ in 0..HEDGE_ORDERS {
+                let Some(order) = hedge(limits, state, &mind.quotes, spot_held, perp_held) else {
+                    break;
+                };
+                if !mind.levered {
+                    let verdicts = submit(&[Action::Leverage {
+                        market: config::PERP.into(),
+                        leverage: config::PERP_LEVERAGE,
+                    }])
+                    .await?;
+                    mind.levered = matches!(verdicts.first(), Some(sdk::Verdict::Accepted(_)));
+                }
+                match place(&order).await? {
+                    Some(size) if size != decide::zero() => {
+                        landed = true;
+                        perp_held += size;
+                    }
+                    _ => break,
+                }
+            }
+        }
+        Plan::Reduce { perp } => {
+            let (spot_held, mut perp_held) = held(state);
+            if let Some(order) = perp
+                && let Some(size) = place(order).await?
+            {
+                landed = true;
+                perp_held += size;
+            }
+            if let Some(order) = trim(limits, state, &mind.quotes, spot_held, perp_held) {
+                landed |= place(&order).await?.is_some();
+            }
         }
     }
-    if let Some(bid) = mind.spot.bid.filter(|bid| *bid > zero() && spot > zero()) {
-        let size = round_down(spot.min(per_order / bid), config::SPOT_SIZE_DECIMALS);
-        if size > zero() {
-            actions.push(Action::Place(order(
-                config::SPOT,
-                Side::Sell,
-                size,
-                bid * (Decimal::from(1) - slip),
-                false,
-            )));
-        }
-    }
-    if actions.is_empty() {
-        return Ok(());
-    }
-    submit(&actions).await.map(|_| ())
+    Ok(landed)
 }
 
 /// Close everything, perp first, because a halt is an unwind with less time.
 /// The per-order cap is lifted: leaving a leg on would cost the depositors
 /// more than a wider fill.
-async fn flatten(mind: &Mind) -> Result<(), String> {
+async fn flatten(mind: &mut Mind) -> Result<(), String> {
+    let limits = Limits {
+        max_order_fraction: Decimal::from(1),
+        ..mind.limits
+    };
     for _ in 0..FLATTEN_STEPS {
         let state = read_state().await?;
+        let plan = Plan::Reduce {
+            perp: unwind(&limits, &state, &mind.quotes),
+        };
         let (spot, perp) = held(&state);
-        if round_down(spot, config::SPOT_SIZE_DECIMALS) <= zero() && perp == zero() {
+        if perp == decide::zero() && trim(&limits, &state, &mind.quotes, spot, perp).is_none() {
             return Ok(());
         }
-        unwind_one_step(mind, &state, Decimal::from(1)).await?;
+        carry_out(mind, &limits, &state, &plan).await?;
     }
     Ok(())
+}
+
+/// Send one order, and say how much of it filled, signed as the position
+/// moved: nothing if it was refused, missed the book, or went unanswered.
+async fn place(order: &Order) -> Result<Option<Decimal>, String> {
+    let verdicts = submit(&[Action::Place(order.clone())]).await?;
+    let Some(sdk::Verdict::Accepted(receipt)) = verdicts.first() else {
+        return Ok(None);
+    };
+    let Ok(Receipt::Filled { size, .. }) = from_payload::<Receipt>(receipt) else {
+        return Ok(None);
+    };
+    Ok(Some(match order.side {
+        Side::Buy => size,
+        Side::Sell => -size,
+    }))
 }
 
 /// Send actions. A refusal is not a reason to stop: the next event is
@@ -442,15 +375,17 @@ sdk::export_agent!(FundingBasis);
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sdk::decimal;
 
     #[test]
     fn the_shipped_limits_can_open_a_position() {
         let minimum = decimal(config::MINIMUM_NOTIONAL);
         let smallest_vault = decimal("2000");
         let wanted = smallest_vault * decimal(config::TARGET_DEPLOYMENT);
-        let step = size_for(wanted, smallest_vault, zero(), &limits(), minimum);
+        let step =
+            decide::pair_notional(wanted, smallest_vault, decide::zero(), &limits(), minimum);
         assert!(
-            step > zero(),
+            step > decide::zero(),
             "a {smallest_vault} vault could not open a position"
         );
     }
@@ -466,31 +401,5 @@ mod tests {
         assert!(manifest.contains("6% of the vault kept liquid") && config::IDLE_BUFFER == "0.06");
         assert!(manifest.contains("a 10% fall") && config::DRAWDOWN_STOP == "0.10");
         assert!(manifest.contains("[drivers.hyperliquid]"));
-    }
-
-    #[test]
-    fn prices_keep_five_figures_and_never_reach_further_than_meant() {
-        assert_eq!(
-            five_figures(decimal("22.51234"), Side::Buy),
-            decimal("22.512")
-        );
-        assert_eq!(
-            five_figures(decimal("22.51234"), Side::Sell),
-            decimal("22.513")
-        );
-        assert_eq!(
-            five_figures(decimal("2710.55"), Side::Buy),
-            decimal("2710.5")
-        );
-        assert_eq!(
-            five_figures(decimal("123456"), Side::Sell),
-            decimal("123460")
-        );
-    }
-
-    #[test]
-    fn sizes_round_down_to_the_venues_decimals() {
-        assert_eq!(round_down(decimal("1.239"), 2), decimal("1.23"));
-        assert_eq!(round_down(decimal("7"), 0), decimal("7"));
     }
 }
