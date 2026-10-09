@@ -1,5 +1,5 @@
 [package]
-name = "mm-quoter-orca"
+name = "mm-quoter-solana"
 description = "Quotes SOL against the dollar as concentrated liquidity on Orca, around the oracle's price"
 version.workspace = true
 edition.workspace = true
