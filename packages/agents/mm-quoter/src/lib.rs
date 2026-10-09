@@ -57,6 +57,9 @@ struct Mind {
     next_id: u128,
     levered: bool,
     dead_man: DeadMan,
+    /// Whether the orders this instance found resting when it began, which
+    /// it can't know as its own, have been cancelled.
+    swept: bool,
 }
 
 const DAY_MS: u64 = 86_400_000;
@@ -167,6 +170,7 @@ impl sdk::Agent for MmQuoter {
             next_id: 0,
             levered: false,
             dead_man: DeadMan::default(),
+            swept: false,
         };
         let book = streams::subscribe::<_, HyperliquidValue>(
             HYPERLIQUID,
@@ -320,6 +324,12 @@ async fn requote(mind: &mut Mind) -> Result<(), String> {
         mind.levered = matches!(verdicts.first(), Some(sdk::Verdict::Accepted(_)));
     }
     let mut actions = cancels(&mut mind.quotes);
+    // A restarted agent remembers no quote: whatever rests on its market
+    // when it first quotes was left by an instance before it, and is
+    // cancelled, so no stale quote outlives the one that set it.
+    if !mind.swept {
+        actions.extend(strays(&state));
+    }
     // Nothing is posted without the venue's deadline behind it, and the
     // deadline is renewed only when due.
     let renewal = mind.dead_man.renewal(mind.now_ms).map(|until| {
@@ -339,6 +349,7 @@ async fn requote(mind: &mut Mind) -> Result<(), String> {
     }
     mind.quotes.mid = Some(mid);
     let verdicts = submit(&actions).await?;
+    mind.swept = true;
     if let Some((at, until)) = renewal
         && matches!(verdicts.get(at), Some(sdk::Verdict::Accepted(_)))
     {
@@ -358,6 +369,20 @@ async fn stand_aside(mind: &mut Mind) -> Result<(), String> {
     actions.push(mind.dead_man.clear());
     mind.quotes.mid = None;
     submit(&actions).await.map(|_| ())
+}
+
+/// Cancels, by the venue's ids, for every order resting on the agent's
+/// market.
+fn strays(state: &AccountState) -> Vec<Action> {
+    state
+        .open_orders
+        .iter()
+        .filter(|order| order.market == config::MARKET)
+        .map(|order| Action::Cancel {
+            market: config::MARKET.into(),
+            order: OrderRef::Venue(order.order_id),
+        })
+        .collect()
 }
 
 /// Cancels for the quotes resting now, which are then forgotten.
@@ -460,6 +485,34 @@ sdk::export_agent!(MmQuoter);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn orders_an_earlier_instance_left_on_the_market_are_cancelled_by_the_venues_ids() {
+        let resting = |market: &str, order_id| hl::OpenOrder {
+            market: market.into(),
+            order_id,
+            side: Side::Sell,
+            size: decimal("0.005"),
+            limit_price: decimal("2702.4"),
+        };
+        let state = AccountState {
+            vault_value: decimal("100"),
+            idle: zero(),
+            station_idle: zero(),
+            account_value: decimal("30"),
+            withdrawable: zero(),
+            positions: Vec::new(),
+            spot: Vec::new(),
+            open_orders: vec![resting(config::MARKET, 7), resting("HYPE/USDC", 8)],
+        };
+        assert_eq!(
+            strays(&state),
+            vec![Action::Cancel {
+                market: config::MARKET.into(),
+                order: OrderRef::Venue(7),
+            }]
+        );
+    }
 
     #[test]
     fn flat_inventory_quotes_symmetrically_around_the_mid() {

@@ -4,10 +4,9 @@
 //! reviewer reads them with the rest of the source, and the claims in
 //! `shonin.toml` say the same thing in words.
 
-/// The spot pair held long, as the driver names it, and the venue's own
-/// name for its book.
+/// The spot pair held long, as the driver names it; its book is asked for by
+/// the same name (the venue numbers its pairs differently on each network).
 pub const SPOT: &str = "HYPE/USDC";
-pub const SPOT_BOOK: &str = "@107";
 /// The token the spot leg is held in.
 pub const SPOT_TOKEN: &str = "HYPE";
 /// Size decimals the venue allows on the spot pair.
