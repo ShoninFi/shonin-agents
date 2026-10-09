@@ -201,6 +201,7 @@ mod tests {
             positions: Vec::new(),
             pools: vec![pool("110", "110")],
             max_positions: 1,
+            outside: false,
         }
     }
 
