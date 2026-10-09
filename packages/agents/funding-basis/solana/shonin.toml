@@ -1,0 +1,26 @@
+[vault]
+chain = "solana"
+
+[description]
+title = "Funding basis on Solana"
+text = """
+Holds the spot asset and shorts the perpetual against it, so the position has \
+no view on the price, and collects the funding the shorts are paid while the \
+perpetual trades above the spot. Both legs sit at the stand-in venue on \
+Solana, in an account the vault's own station controls, which the trading key \
+can trade through but never withdraw from. When funding falls far enough it \
+unwinds, and when the vault falls far enough from its peak it only reduces.
+
+The edge is mechanical and it compresses as more capital chases it, which is \
+the honest thing to say about it: the record shows the size it was earned at, \
+and a larger vault should expect less.
+"""
+claims = [
+    "Gross exposure at most twice the vault's value",
+    "No single order above 5% of the vault",
+    "6% of the vault kept liquid, so an ordinary withdrawal closes nothing",
+    "Only reduces after a 10% fall from the vault's peak",
+    "One market, BTC against BTC-PERP, and nothing else",
+]
+
+[drivers.local]

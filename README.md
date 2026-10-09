@@ -27,7 +27,7 @@ Copy `.env.example` to `.env` first, and set `SHONIN_PLATFORM_DIR` to a checkout
 
 | Agent | What it does |
 | --- | --- |
-| `funding-basis` | Holds the spot asset, shorts the perpetual against it, and collects the funding between them. The position has no view on the price, so what is left is the carry. |
+| `funding-basis` | Holds the spot asset, shorts the perpetual against it, and collects the funding between them. The position has no view on the price, so what is left is the carry. Published with a vault on Base, on Hyperliquid (`funding-basis/hyperliquid`) or on Solana (`funding-basis/solana`). |
 
 ## Layout
 
