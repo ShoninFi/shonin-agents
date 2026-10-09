@@ -120,6 +120,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "funding-basis-solana"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "shonin-strategy-sdk",
+]
+
+[[package]]
 name = "futures"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
