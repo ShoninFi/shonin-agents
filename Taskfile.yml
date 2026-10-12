@@ -47,7 +47,7 @@ tasks:
   build:
     desc: "Build every agent as a component"
     cmds:
-      - cargo build --release --locked --target wasm32-wasip2 -p funding-basis -p funding-basis-hyperliquid -p funding-basis-solana -p mm-quoter -p weekend-carry -p catalyst
+      - cargo build --release --locked --target wasm32-wasip2 -p funding-basis -p funding-basis-hyperliquid -p funding-basis-solana -p mm-quoter -p mm-quoter-solana -p weekend-carry -p catalyst
 
   publish:
     desc: "Publish an agent to a platform running locally (AGENT=funding-basis)"
@@ -73,14 +73,14 @@ tasks:
     desc: "Compile every crate, natively and as a component"
     cmds:
       - cargo check --workspace --all-targets
-      - cargo check -p funding-basis -p funding-basis-hyperliquid -p funding-basis-solana -p mm-quoter -p weekend-carry -p catalyst --target wasm32-wasip2
+      - cargo check -p funding-basis -p funding-basis-hyperliquid -p funding-basis-solana -p mm-quoter -p mm-quoter-solana -p weekend-carry -p catalyst --target wasm32-wasip2
 
   lint:
     desc: "rustfmt --check and clippy -D warnings"
     cmds:
       - cargo fmt --all --check
       - cargo clippy --workspace --all-targets -- -D warnings
-      - cargo clippy -p funding-basis -p funding-basis-hyperliquid -p funding-basis-solana -p mm-quoter -p weekend-carry -p catalyst --target wasm32-wasip2 -- -D warnings
+      - cargo clippy -p funding-basis -p funding-basis-hyperliquid -p funding-basis-solana -p mm-quoter -p mm-quoter-solana -p weekend-carry -p catalyst --target wasm32-wasip2 -- -D warnings
 
   fmt:
     desc: "Format every crate"

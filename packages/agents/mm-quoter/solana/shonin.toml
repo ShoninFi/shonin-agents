@@ -1,0 +1,27 @@
+[vault]
+chain = "solana"
+
+[description]
+title = "Market maker on Orca"
+text = """
+Quotes SOL against the dollar on Orca the way a market maker quotes a book: \
+as one band of concentrated liquidity around the oracle's price, which earns \
+the pool's fee on every trade that crosses it. When the price nears the edge \
+of the band it takes the liquidity out, rebalances the two tokens at the pool \
+and sets a new band around the price, and it does nothing while the pool's \
+price strays from the oracle's, since a pool can be pushed for a moment and \
+the oracle can't.
+
+Providing liquidity loses against simply holding when the price runs one \
+way: what it earns is the fee, and the record shows whether the fee was \
+worth it.
+"""
+claims = [
+    "One pool, SOL against the dollar, and one position at a time",
+    "At most 80% of the vault in the pool; 6% of the vault kept liquid",
+    "Each band 4% either side of the oracle's price",
+    "Acts only while the pool's price is within 1% of the oracle's",
+    "Takes all its liquidity out and sells its SOL when the vault halts",
+]
+
+[drivers.orca]

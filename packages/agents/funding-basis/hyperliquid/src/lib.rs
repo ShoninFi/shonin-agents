@@ -102,7 +102,7 @@ impl sdk::Agent for FundingBasis {
         let spot_book = streams::subscribe::<_, HyperliquidValue>(
             HYPERLIQUID,
             &HyperliquidFeed::Book {
-                coin: config::SPOT_BOOK.into(),
+                coin: config::SPOT.into(),
             },
         )?
         .map(|value| top_of(value).map_or(Woke::Nothing, Woke::SpotBook));
