@@ -13,7 +13,7 @@ tasks:
       - task --list
 
   setup:
-    desc: "Install the toolchain, enable the commit guard, and point the SDK at a local platform"
+    desc: "Install the toolchain and enable the commit guard"
     cmds:
       - rustup show active-toolchain || rustup toolchain install
       - git config core.hooksPath .githooks
@@ -24,25 +24,6 @@ tasks:
         for f in .private/terms.txt .private/review.md; do
           [ -f "$f" ] || echo "missing: $f (commit guard input; commits are blocked until it exists)"
         done
-      - task: patch
-
-  patch:
-    desc: "Point the SDK at a local platform checkout (SHONIN_PLATFORM_DIR)"
-    cmds:
-      - |
-        if [ -z "${SHONIN_PLATFORM_DIR:-}" ]; then
-          echo "SHONIN_PLATFORM_DIR is unset: the SDK resolves from the registry."
-          rm -f .cargo/config.toml
-          exit 0
-        fi
-        mkdir -p .cargo
-        cat > .cargo/config.toml <<EOF
-        # Written by \`task patch\`; gitignored. The SDK is declared by version
-        # in Cargo.toml and resolved from a checkout while the two move together.
-        [patch.crates-io]
-        shonin-strategy-sdk = { path = "${SHONIN_PLATFORM_DIR}/packages/strategy-sdk" }
-        EOF
-        echo "SDK patched to ${SHONIN_PLATFORM_DIR}"
 
   build:
     desc: "Build every agent as a component"

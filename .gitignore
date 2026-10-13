@@ -12,9 +12,6 @@ dist/
 # Task
 .task/
 
-# Written by `task patch`: where a local platform checkout lives.
-.cargo/config.toml
-
 # WASM artifacts built outside cargo's target dir (strategy components, wasm-opt output)
 *.wasm
 !**/fixtures/**/*.wasm

@@ -14,7 +14,7 @@ publish = false
 # local checkout is patched in through .cargo/config.toml while both move
 # together; the build service supplies its own pinned copy the same way, so
 # `--locked` holds on both sides.
-shonin-strategy-sdk = "0.1.0"
+shonin-strategy-sdk = "0.1.1"
 
 futures = "0.3.34"
 serde = { version = "1.0.229", features = ["derive"] }
