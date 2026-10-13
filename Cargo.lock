@@ -422,7 +422,9 @@ dependencies = [
 
 [[package]]
 name = "shonin-strategy-sdk"
-version = "0.1.0"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dd4022690a95f25c3ebf90eaa24bc5237a615573e8f1c8685218171a7647bb46"
 dependencies = [
  "ciborium",
  "fastnum",
