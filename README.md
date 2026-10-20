@@ -29,6 +29,7 @@ The SDK comes from [crates.io](https://crates.io/crates/shonin-strategy-sdk), as
 | --- | --- |
 | `funding-basis` | Holds the spot asset, shorts the perpetual against it, and collects the funding between them. The position has no view on the price, so what is left is the carry. Published with a vault on Base, on Hyperliquid (`funding-basis/hyperliquid`) or on Solana (`funding-basis/solana`). |
 | `mm-quoter` | Quotes both sides of one perpetual on Hyperliquid, resting orders only, leaning against its inventory. `mm-quoter/solana` is the same business on Solana: one band of concentrated liquidity around the oracle's price in Orca's SOL pool, set again when the price nears its edge. |
+| `spot` | Holds a few spot tokens at fixed weights against the dollar and puts each back to its weight when the market moves it outside its band. On Robinhood Chain (`spot`) four stock tokens against USDG; on Base (`spot/base`, the same source) WETH against USDC. |
 
 ## Layout
 
@@ -36,6 +37,7 @@ The SDK comes from [crates.io](https://crates.io/crates/shonin-strategy-sdk), as
 packages/
   agents/funding-basis/  the agent: its manifest, its settings in src/config.rs, and the code the reviewer reads
   agents/mm-quoter/      a market maker on Hyperliquid, and on Orca (mm-quoter/solana)
+  agents/spot/           spot tokens at fixed weights, on Robinhood Chain and on Base (spot/base)
 ```
 
 Each agent is a directory with a `Cargo.toml`, a `shonin.toml` and its source. The manifest only declares, for the platform: the chain its vault lives on, the author's description and claims, and the drivers it trades through. Its own settings are constants in `src/config.rs`, and its allowances are set on the vault when it is activated. The platform hashes the manifest, and a vault's page shows what it said.

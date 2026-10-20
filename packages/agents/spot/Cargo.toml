@@ -1,0 +1,19 @@
+[package]
+name = "spot"
+description = "Holds a few spot tokens at fixed weights against the dollar, rebalancing when one drifts outside its band"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+futures.workspace = true
+serde.workspace = true
+shonin-strategy-sdk.workspace = true
+
+[lints]
+workspace = true
