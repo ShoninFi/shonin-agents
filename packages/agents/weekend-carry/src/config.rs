@@ -34,6 +34,10 @@ pub const IDLE_BUFFER: &str = "0.06";
 /// Both legs cut together after a 10% fall in a vault share's value from its
 /// peak since the agent last started, as it measures it (`per_share.rs`).
 pub const DRAWDOWN_STOP: &str = "0.10";
+/// Once cut, both legs are opened again only when a share, measured as if
+/// the vault had kept what it held when the stop came, is back within 5% of
+/// its peak.
+pub const STOP_LIFTS_WITHIN: &str = "0.05";
 
 /// The weekend, in UTC: from Friday 21:00 (the cash market has closed) to
 /// Monday 13:30 (it opens). Outside it, an open carry is closed.

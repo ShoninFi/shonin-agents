@@ -211,10 +211,11 @@ pub fn wakes_for(event: &[u8]) -> bool {
 }
 
 /// Whether a vault share's value has fallen far enough from its peak (see
-/// [`PerShare`]) that this strategy should stop opening anything and only
-/// get smaller.
+/// [`PerShare`]), now or at an earlier look the stop hasn't lifted since,
+/// that this strategy should stop opening anything and only get smaller.
 pub fn only_reducing(share: &PerShare, limits: &Limits) -> bool {
-    share.peak > zero() && (share.peak - share.now) / share.peak >= limits.drawdown_stop
+    share.stopped()
+        || (share.peak > zero() && (share.peak - share.now) / share.peak >= limits.drawdown_stop)
 }
 
 /// What the account holds, for [`PerShare`]: the spot and the perpetual each
@@ -836,7 +837,13 @@ mod tests {
     }
 
     fn plan(state: &AccountState, quotes: &Quotes) -> Plan {
-        decide(&limits(), &PerShare::default(), zero(), state, quotes)
+        decide(
+            &limits(),
+            &PerShare::new(config::DRAWDOWN_STOP, config::STOP_LIFTS_WITHIN),
+            zero(),
+            state,
+            quotes,
+        )
     }
 
     fn settle(state: &mut AccountState) -> (usize, usize) {
@@ -1085,15 +1092,23 @@ mod tests {
         *perp_size(&mut before) = d("-400");
         revalue(&mut before);
         let quotes = quotes(ABOVE_ENTRY);
-        let mut share = PerShare::default();
-        share.look(before.vault_value, share_holdings(&before, &quotes, zero()));
+        let mut share = PerShare::new(config::DRAWDOWN_STOP, config::STOP_LIFTS_WITHIN);
+        share.look(
+            before.vault_value,
+            Some(before.vault_value),
+            share_holdings(&before, &quotes, zero()),
+        );
         // A holder of 15% of the shares leaves, and their fraction of both
         // legs and of the cash goes with them. No price moved.
         let mut after = state("12750", "4250");
         balance(&mut after, config::SPOT_TOKEN).total = d("340");
         *perp_size(&mut after) = d("-340");
         revalue(&mut after);
-        share.look(after.vault_value, share_holdings(&after, &quotes, zero()));
+        share.look(
+            after.vault_value,
+            Some(after.vault_value),
+            share_holdings(&after, &quotes, zero()),
+        );
         assert_eq!(share.now, d("1"));
         assert!(!only_reducing(&share, &limits()));
         assert_eq!(
@@ -1108,9 +1123,10 @@ mod tests {
         balance(&mut held_now, config::SPOT_TOKEN).total = d("400");
         *perp_size(&mut held_now) = d("-400");
         revalue(&mut held_now);
-        let mut share = PerShare::default();
+        let mut share = PerShare::new(config::DRAWDOWN_STOP, config::STOP_LIFTS_WITHIN);
         share.look(
             held_now.vault_value,
+            Some(held_now.vault_value),
             share_holdings(&held_now, &quotes(ABOVE_ENTRY), zero()),
         );
         // The perpetual $8 higher and the spot where it was: $3,200 lost
@@ -1123,7 +1139,11 @@ mod tests {
         let mut after = held_now.clone();
         after.vault_value -= d("3200");
         let mut fallen = share.clone();
-        fallen.look(after.vault_value, share_holdings(&after, &apart, zero()));
+        fallen.look(
+            after.vault_value,
+            Some(after.vault_value),
+            share_holdings(&after, &apart, zero()),
+        );
         assert!(only_reducing(&fallen, &limits()), "{:?}", fallen.now);
         assert!(matches!(
             decide(&limits(), &fallen, zero(), &after, &apart),
@@ -1131,7 +1151,11 @@ mod tests {
         ));
         // Funding the short was paid meanwhile counts for it.
         let mut paid = share.clone();
-        paid.look(after.vault_value, share_holdings(&after, &apart, d("400")));
+        paid.look(
+            after.vault_value,
+            Some(after.vault_value),
+            share_holdings(&after, &apart, d("400")),
+        );
         assert!(!only_reducing(&paid, &limits()), "{:?}", paid.now);
     }
 
@@ -1148,7 +1172,7 @@ mod tests {
         let decided = |state: &AccountState, leavers: &Leavers| {
             decide(
                 &limits(),
-                &PerShare::default(),
+                &PerShare::new(config::DRAWDOWN_STOP, config::STOP_LIFTS_WITHIN),
                 leavers.held(),
                 state,
                 &quotes(ABOVE_ENTRY),

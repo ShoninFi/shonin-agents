@@ -18,6 +18,13 @@ value itself: from one look to the next, a share gains or loses what the \
 moves of Chainlink's prices did to what the vault held, so deposits and \
 withdrawals never move it. It starts again from a share's value at each \
 start of the agent, so a fall from before a restart is not remembered.
+
+A look at which one of the vault's accounts couldn't be read, or whose \
+accounts don't add up to what it holds, is skipped: nothing is decided from \
+it, and a share's value doesn't move. Once stopped it only sells, and from then on a share is \
+measured as if the vault had kept what it held when the stop came, since what \
+it no longer holds no longer moves: the stop lifts, and it buys again, once that \
+measure is back within 5% of its peak.
 """
 claims = [
     "Long only: holds WETH, 50% of the vault, and USDC",
@@ -25,6 +32,7 @@ claims = [
     "No single order above 5% of the vault",
     "Never trades while the pool is more than 2% from Chainlink's price",
     "Only sells after a 10% fall in a vault share's value from its peak since the agent last started, as it measures it from Chainlink's prices: deposits and withdrawals never count",
+    "Once stopped, buys again only when a vault share, measured as if the vault had kept what it held when the stop came, is back within 5% of its peak",
     "6% of the vault kept liquid, so an ordinary withdrawal closes nothing",
 ]
 

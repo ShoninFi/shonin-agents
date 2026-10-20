@@ -83,6 +83,9 @@ pub struct Picture {
     /// [`PerShare`](crate::per_share::PerShare)).
     pub share: Decimal,
     pub peak: Decimal,
+    /// The stop came at an earlier look and hasn't lifted since (see
+    /// [`PerShare`](crate::per_share::PerShare)).
+    pub stop_holds: bool,
     pub names: Vec<Name>,
 }
 
@@ -133,9 +136,12 @@ pub fn held(names: &[Name]) -> Vec<Held> {
 }
 
 impl Picture {
-    /// Whether a vault share's value has fallen by the stop from its peak.
+    /// Whether a vault share's value has fallen by the stop from its peak,
+    /// now or at an earlier look the stop hasn't lifted since.
     pub fn only_reducing(&self) -> bool {
-        self.peak > zero() && (self.peak - self.share) / self.peak >= decimal(config::DRAWDOWN_STOP)
+        self.stop_holds
+            || (self.peak > zero()
+                && (self.peak - self.share) / self.peak >= decimal(config::DRAWDOWN_STOP))
     }
 
     fn gross(&self) -> Decimal {
@@ -248,6 +254,7 @@ mod tests {
             vault_value: decimal("100000"),
             share: decimal("1"),
             peak: decimal("1"),
+            stop_holds: false,
             names,
         }
     }
@@ -330,18 +337,85 @@ mod tests {
         );
         assert!(manifest.contains("a fall from before a restart is not remembered"));
         assert!(!manifest.contains("fall from the vault's peak"));
+        assert!(manifest.contains("couldn't be read"));
+        assert!(
+            manifest.contains(
+                "as if the vault had kept what it held when the stop came, is back within 5% of its peak"
+            ) && config::STOP_LIFTS_WITHIN == "0.05"
+        );
+    }
+
+    /// The share's measure, as the agent keeps it.
+    fn measure() -> crate::per_share::PerShare {
+        crate::per_share::PerShare::new(config::DRAWDOWN_STOP, config::STOP_LIFTS_WITHIN)
+    }
+
+    /// `p` with the share's value, peak and stop `per_share` has after a
+    /// look at it whose accounts all read and add up.
+    fn looked(per_share: &mut crate::per_share::PerShare, mut p: Picture) -> Picture {
+        per_share.look(p.vault_value, Some(p.vault_value), held(&p.names));
+        p.share = per_share.now;
+        p.peak = per_share.peak;
+        p.stop_holds = per_share.stopped();
+        p
+    }
+
+    #[test]
+    fn a_look_with_an_account_unread_never_moves_a_share() {
+        let mut per_share = measure();
+        let mut carry = spy("710");
+        carry.tokens = decimal("100");
+        carry.perp_position = decimal("-100");
+        looked(&mut per_share, picture(SATURDAY, vec![carry.clone()]));
+        // The Safe's value went unread: the balances add up to $6,000, and
+        // the perpetual has moved $5 against the short meanwhile.
+        let mut moved = carry.clone();
+        moved.perp_bid = decimal("715");
+        moved.perp_ask = decimal("715.05");
+        assert!(!per_share.look(decimal("6000"), None, held(&[moved.clone()])));
+        assert_eq!(per_share.now, decimal("1"));
+        // Read whole again: the $500 lost counts once, on $100,000.
+        let mut whole = picture(SATURDAY, vec![moved]);
+        whole.vault_value = decimal("99500");
+        let whole = looked(&mut per_share, whole);
+        assert_eq!(whole.share, decimal("0.995"));
+        assert!(!whole.only_reducing());
+    }
+
+    #[test]
+    fn once_both_legs_are_cut_the_stop_lifts_when_the_pair_has_recovered() {
+        let mut per_share = measure();
+        let mut carry = spy("710");
+        carry.tokens = decimal("100");
+        carry.perp_position = decimal("-100");
+        looked(&mut per_share, picture(SATURDAY, vec![carry.clone()]));
+        // The gap widens $110 a share: 11% lost, stopped.
+        carry.perp_bid = decimal("820");
+        carry.perp_ask = decimal("820.05");
+        let mut cut = picture(SATURDAY, vec![carry.clone()]);
+        cut.vault_value = decimal("89000");
+        assert!(looked(&mut per_share, cut.clone()).only_reducing());
+        // Both legs cut: nothing held moves, the pair as held still does.
+        carry.tokens = zero();
+        carry.perp_position = zero();
+        cut.names = vec![carry.clone()];
+        assert!(looked(&mut per_share, cut.clone()).only_reducing());
+        // The gap closes again: the pair as held is back where it was.
+        carry.perp_bid = decimal("710");
+        carry.perp_ask = decimal("710.05");
+        cut.names = vec![carry];
+        let back = looked(&mut per_share, cut);
+        assert!(
+            !back.only_reducing(),
+            "still stopped at share {}",
+            back.share
+        );
     }
 
     #[test]
     fn a_leaver_taking_a_tenth_of_the_vault_does_not_stop_the_agent() {
-        use crate::per_share::PerShare;
-        let mut per_share = PerShare::default();
-        let mut looked = |mut p: Picture| {
-            per_share.look(p.vault_value, held(&p.names));
-            p.share = per_share.now;
-            p.peak = per_share.peak;
-            p
-        };
+        let mut per_share = measure();
+        let mut looked = |p: Picture| looked(&mut per_share, p);
         // A $100,000 vault carrying 100 SPY tokens against 100 shorted.
         let mut carry = spy("710");
         carry.tokens = decimal("100");
@@ -362,22 +436,18 @@ mod tests {
 
     #[test]
     fn a_fall_in_a_share_s_value_past_the_stop_only_reduces() {
-        use crate::per_share::PerShare;
-        let mut per_share = PerShare::default();
+        let mut per_share = measure();
         let mut carry = spy("710");
         carry.tokens = decimal("100");
         carry.perp_position = decimal("-100");
-        let before = picture(SATURDAY, vec![carry.clone()]);
-        per_share.look(before.vault_value, held(&before.names));
+        looked(&mut per_share, picture(SATURDAY, vec![carry.clone()]));
         // The gap widens: the perpetual $110 a share higher, the token
         // where it was, on 100 shorted in a $100,000 vault: 11% lost.
         carry.perp_bid = decimal("820");
         carry.perp_ask = decimal("820.05");
         let mut after = picture(SATURDAY, vec![carry]);
         after.vault_value = decimal("89000");
-        per_share.look(after.vault_value, held(&after.names));
-        after.share = per_share.now;
-        after.peak = per_share.peak;
+        let after = looked(&mut per_share, after);
         assert!(after.only_reducing(), "{:?}", after.share);
         assert!(matches!(after.next(), Step::Close { .. }));
     }

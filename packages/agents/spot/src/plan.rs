@@ -44,6 +44,9 @@ pub struct Picture {
     /// [`PerShare`](crate::per_share::PerShare)).
     pub share: Decimal,
     pub peak: Decimal,
+    /// The stop came at an earlier look and hasn't lifted since (see
+    /// [`PerShare`](crate::per_share::PerShare)).
+    pub stop_holds: bool,
     pub names: Vec<Name>,
 }
 
@@ -109,11 +112,19 @@ pub fn held(names: &[Name]) -> Vec<Held> {
         .collect()
 }
 
+/// What the vault is worth by what it holds of `names`, at Chainlink's
+/// prices, and `dollars` besides: what its accounts must add up to.
+pub fn accounted(names: &[Name], dollars: Decimal) -> Decimal {
+    names.iter().fold(dollars, |sum, name| sum + name.worth())
+}
+
 impl Picture {
     /// Whether a vault share's value has fallen past the stop from its
-    /// peak.
+    /// peak, now or at an earlier look the stop hasn't lifted since.
     pub fn stopped(&self) -> bool {
-        self.peak > zero() && self.share < self.peak * (one() - decimal(config::DRAWDOWN_STOP))
+        self.stop_holds
+            || (self.peak > zero()
+                && self.share < self.peak * (one() - decimal(config::DRAWDOWN_STOP)))
     }
 
     /// The dollars a buy may spend: the Safe's, and the vault's cash above
@@ -229,6 +240,7 @@ mod tests {
             safe_dollars: zero(),
             share: one(),
             peak: one(),
+            stop_holds: false,
             names: vec![name],
         }
     }
@@ -341,6 +353,7 @@ mod tests {
             safe_dollars: zero(),
             share: one(),
             peak: one(),
+            stop_holds: false,
             names,
         };
         assert!(matches!(picture.next(false), Step::Sell { index: 1, .. }));
@@ -368,18 +381,73 @@ mod tests {
         assert_eq!(base("0", "1000").next(true), Step::Nothing);
     }
 
+    /// The share's measure, as the agent keeps it.
+    fn measure() -> PerShare {
+        PerShare::new(config::DRAWDOWN_STOP, config::STOP_LIFTS_WITHIN)
+    }
+
     /// `picture` with the share's value and peak `per_share` has after it
-    /// looks at it.
+    /// looks at it, its holdings counted as the agent counts them.
     fn looked(per_share: &mut PerShare, mut picture: Picture) -> Picture {
-        per_share.look(picture.value, held(&picture.names));
+        let accounted = accounted(&picture.names, picture.cash + picture.safe_dollars);
+        per_share.look(picture.value, Some(accounted), held(&picture.names));
         picture.share = per_share.now;
         picture.peak = per_share.peak;
+        picture.stop_holds = per_share.stopped();
+        picture
+    }
+
+    /// The vault of [`base`] with WETH at `price`.
+    fn at(weth: &str, price: &str, cash: &str) -> Picture {
+        let mut picture = base(weth, cash);
+        picture.names[0].feed_price = d(price);
+        picture.names[0].market_price = d(price);
+        picture.value = picture.names[0].worth() + picture.cash;
         picture
     }
 
     #[test]
+    fn a_look_whose_value_misses_an_account_does_not_magnify_a_move_into_the_stop() {
+        let mut per_share = measure();
+        // $1,000: $500 of WETH at $2,500, $500 of cash.
+        looked(&mut per_share, base("0.2", "500"));
+        // One look at which the Safe's value went unread: the vault's
+        // balances add up to its own cash alone, $60.
+        let mut unread = base("0.2", "500");
+        unread.value = d("60");
+        looked(&mut per_share, unread);
+        // Everything read again; WETH 1.5% lower, $7.50 of a $992.50 vault.
+        let next = looked(&mut per_share, at("0.2", "2462.5", "500"));
+        assert!(
+            !next.stopped(),
+            "share {} of peak {}",
+            next.share,
+            next.peak
+        );
+        assert_eq!(next.share, d("0.9925"));
+    }
+
+    #[test]
+    fn once_sold_out_the_stop_lifts_when_what_it_held_has_recovered() {
+        let mut per_share = measure();
+        looked(&mut per_share, at("0.2", "2500", "500"));
+        // WETH down 25%: the share 12.5% down, stopped, and it sells out.
+        assert!(looked(&mut per_share, at("0.2", "1875", "500")).stopped());
+        assert!(looked(&mut per_share, at("0", "1875", "875")).stopped());
+        // WETH up a little: still more than 5% under the peak, as if the
+        // WETH had been kept, so still stopped and still not buying.
+        let partly = looked(&mut per_share, at("0", "2000", "875"));
+        assert!(partly.stopped(), "lifted at share {}", partly.share);
+        assert_eq!(partly.next(false), Step::Nothing);
+        // WETH back to $2,500: the stop lifts, and it buys back in.
+        let back = looked(&mut per_share, at("0", "2500", "875"));
+        assert!(!back.stopped(), "still stopped at share {}", back.share);
+        assert!(matches!(back.next(false), Step::Buy { .. }));
+    }
+
+    #[test]
     fn a_leaver_taking_a_tenth_of_the_vault_does_not_stop_the_agent() {
-        let mut per_share = PerShare::default();
+        let mut per_share = measure();
         // A $1,000 vault at its weights: $500 of WETH, $500 of cash.
         let before = looked(&mut per_share, base("0.2", "500"));
         assert_eq!(before.next(false), Step::Nothing);
@@ -402,7 +470,7 @@ mod tests {
 
     #[test]
     fn a_fall_in_a_share_s_value_past_the_stop_sells() {
-        let mut per_share = PerShare::default();
+        let mut per_share = measure();
         let at = |price: &str| {
             let mut picture = base("0.2", "500");
             picture.names[0].feed_price = d(price);
@@ -424,7 +492,7 @@ mod tests {
             down.next(false)
         );
         // Not quite 10% under: not stopped.
-        let mut per_share = PerShare::default();
+        let mut per_share = measure();
         looked(&mut per_share, at("2750"));
         let nearly = looked(&mut per_share, at("2240"));
         assert!(!nearly.stopped(), "{:?}", nearly.share);
@@ -433,6 +501,7 @@ mod tests {
     #[test]
     fn each_manifest_claims_the_stop_as_a_fall_in_a_share_s_value() {
         assert_eq!(config::DRAWDOWN_STOP, "0.10");
+        assert_eq!(config::STOP_LIFTS_WITHIN, "0.05");
         for manifest in [
             include_str!("../shonin.toml"),
             include_str!("../base/shonin.toml"),
@@ -440,6 +509,10 @@ mod tests {
             assert!(manifest.contains("a 10% fall in a vault share's value"));
             assert!(manifest.contains("a fall from before a restart is not remembered"));
             assert!(!manifest.contains("fall from the vault's peak"));
+            assert!(manifest.contains("couldn't be read"));
+            assert!(manifest.contains(
+                "as if the vault had kept what it held when the stop came, is back within 5% of its peak"
+            ));
         }
     }
 
