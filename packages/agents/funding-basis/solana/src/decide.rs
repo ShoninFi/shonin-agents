@@ -115,7 +115,7 @@ pub fn wakes_for(settings: &Settings, event: &[u8]) -> bool {
 }
 
 /// Whether a vault share's value has fallen far enough from its peak (see
-/// [`PerShare`]), now or at an earlier look the stop hasn't lifted since,
+/// [`PerShare`]), now or at any earlier look since the agent started,
 /// that this strategy should stop opening anything and only get smaller.
 pub fn only_reducing(share: &PerShare, limits: &Limits) -> bool {
     share.stopped()
@@ -682,7 +682,7 @@ mod tests {
         decide(
             &Settings::shipped(),
             &limits(),
-            &PerShare::new(config::DRAWDOWN_STOP, config::STOP_LIFTS_WITHIN),
+            &PerShare::new(config::DRAWDOWN_STOP),
             zero(),
             state,
         )
@@ -1055,7 +1055,7 @@ mod tests {
         // A $100,000 vault carrying 0.8 against 0.8 short, $15,000 of it at
         // the venue in cash and $85,000 in the vault.
         let before = holding(state("85000", "15000", ABOVE_ENTRY), "0.8", "0.8");
-        let mut share = PerShare::new(config::DRAWDOWN_STOP, config::STOP_LIFTS_WITHIN);
+        let mut share = PerShare::new(config::DRAWDOWN_STOP);
         looked(&mut share, &before);
         // A holder of 15% of the shares leaves, and their fraction of both
         // legs and of the cash goes with them. No price moved.
@@ -1071,9 +1071,9 @@ mod tests {
     }
 
     #[test]
-    fn once_closed_out_after_the_stop_it_opens_again_when_the_pair_has_recovered() {
+    fn once_closed_out_after_the_stop_it_opens_nothing_whatever_the_pair_does() {
         let before = holding(state("85000", "15000", ABOVE_ENTRY), "0.8", "0.8");
-        let mut share = PerShare::new(config::DRAWDOWN_STOP, config::STOP_LIFTS_WITHIN);
+        let mut share = PerShare::new(config::DRAWDOWN_STOP);
         looked(&mut share, &before);
         // The spot falls $14,000 under the perpetual: stopped.
         let mut after = before.clone();
@@ -1084,17 +1084,26 @@ mod tests {
         }
         after.vault_value -= d("11200");
         assert!(only_reducing(&looked(&mut share, &after), &limits()));
-        // Closed out: no position left, but each market still has a value.
+        // Closed out: no position left, so nothing the markets do moves it.
         let mut out = holding(state("88800", "0", ABOVE_ENTRY), "0", "0");
         out.markets = after.markets.clone();
-        assert_eq!(held(&out).len(), 2);
-        assert!(only_reducing(&looked(&mut share, &out), &limits()));
-        // The spot back where it was: the pair as held is whole again.
+        let cut = looked(&mut share, &out).now;
+        assert!(only_reducing(&share, &limits()));
+        // The spot back where it was, and funding above entry: still
+        // stopped, the share where the cut left it, and nothing opened.
         out.markets = before.markets.clone();
         let back = looked(&mut share, &out);
-        assert!(!only_reducing(&back, &limits()), "{:?}", back.now);
-        assert!(matches!(
+        assert!(only_reducing(&back, &limits()), "lifted at {:?}", back.now);
+        assert_eq!(back.now, cut);
+        assert_eq!(
             decide(&Settings::shipped(), &limits(), &back, zero(), &out),
+            Plan::Nothing
+        );
+        // A restart measures afresh, and may open again.
+        let mut restarted = PerShare::new(config::DRAWDOWN_STOP);
+        let fresh = looked(&mut restarted, &out);
+        assert!(matches!(
+            decide(&Settings::shipped(), &limits(), &fresh, zero(), &out),
             Plan::Build { .. }
         ));
     }
@@ -1102,7 +1111,7 @@ mod tests {
     #[test]
     fn a_fall_in_a_share_s_value_past_the_stop_only_reduces() {
         let before = holding(state("85000", "15000", ABOVE_ENTRY), "0.8", "0.8");
-        let mut share = PerShare::new(config::DRAWDOWN_STOP, config::STOP_LIFTS_WITHIN);
+        let mut share = PerShare::new(config::DRAWDOWN_STOP);
         looked(&mut share, &before);
         // The spot falls $14,000 under a perpetual that doesn't: $11,200 of
         // a $100,000 vault lost.
@@ -1127,7 +1136,7 @@ mod tests {
                 market.funding_index += d("2000");
             }
         }
-        let mut share = PerShare::new(config::DRAWDOWN_STOP, config::STOP_LIFTS_WITHIN);
+        let mut share = PerShare::new(config::DRAWDOWN_STOP);
         looked(&mut share, &before);
         let share = looked(&mut share, &paid);
         assert!(!only_reducing(&share, &limits()), "{:?}", share.now);
@@ -1149,7 +1158,7 @@ mod tests {
             decide(
                 &Settings::shipped(),
                 &limits(),
-                &PerShare::new(config::DRAWDOWN_STOP, config::STOP_LIFTS_WITHIN),
+                &PerShare::new(config::DRAWDOWN_STOP),
                 leavers.held(),
                 state,
             )

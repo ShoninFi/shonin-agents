@@ -21,19 +21,19 @@ withdrawals never move it. It starts again from a share's value at each \
 start of the agent, so a fall from before a restart is not remembered.
 
 A look at which one of the vault's accounts couldn't be read, or whose \
-accounts don't add up to what it holds, is skipped: nothing is decided from \
-it, and a share's value doesn't move. Once stopped it only sells, and from then on a share is \
-measured as if the vault had kept what it held when the stop came, since what \
-it no longer holds no longer moves: the stop lifts, and it buys again, once that \
-measure is back within 5% of its peak.
+accounts don't add up to what it holds, is skipped: a share's value doesn't \
+move, and no step is decided from it, save a halt's, which sells what the \
+Safe holds whatever the measure made of the look. Once stopped it sells \
+everything and buys nothing more: the stop holds until the agent next \
+starts, and a restart starts the measure afresh from a share's value then.
 """
 claims = [
     "Long only: holds TSLA, AMD, AMZN and PLTR stock tokens, 15% of the vault each, and dollars",
     "Rebalances a token only once it is more than 3 points of the vault from its weight",
     "No single order above 5% of the vault",
     "Never trades a token whose pool is more than 2% from its Chainlink price, or whose oracle is paused",
-    "Only sells after a 10% fall in a vault share's value from its peak since the agent last started, as it measures it from Chainlink's prices: deposits and withdrawals never count",
-    "Once stopped, buys again only when a vault share, measured as if the vault had kept what it held when the stop came, is back within 5% of its peak",
+    "Sells everything only after a 10% fall in a vault share's value from its peak since the agent last started, as it measures it from Chainlink's prices (deposits and withdrawals never count), or when the vault halts; otherwise it sells only to put a token back towards its weight",
+    "Once stopped, buys nothing until the agent restarts: the stop holds until then, and a restart measures a share afresh from its value then",
     "6% of the vault kept liquid, so an ordinary withdrawal closes nothing",
 ]
 

@@ -44,8 +44,8 @@ pub struct Picture {
     /// [`PerShare`](crate::per_share::PerShare)).
     pub share: Decimal,
     pub peak: Decimal,
-    /// The stop came at an earlier look and hasn't lifted since (see
-    /// [`PerShare`](crate::per_share::PerShare)).
+    /// The stop came at a look since the agent started: it holds until the
+    /// agent restarts (see [`PerShare`](crate::per_share::PerShare)).
     pub stop_holds: bool,
     pub names: Vec<Name>,
 }
@@ -120,7 +120,7 @@ pub fn accounted(names: &[Name], dollars: Decimal) -> Decimal {
 
 impl Picture {
     /// Whether a vault share's value has fallen past the stop from its
-    /// peak, now or at an earlier look the stop hasn't lifted since.
+    /// peak, now or at any earlier look since the agent started.
     pub fn stopped(&self) -> bool {
         self.stop_holds
             || (self.peak > zero()
@@ -137,6 +137,23 @@ impl Picture {
             zero()
         };
         self.safe_dollars + spare
+    }
+
+    /// The next step of a halt, at a look the share's measure took or
+    /// skipped (`looked`). It reads only what the Safe holds of each token,
+    /// their prices, and the vault's value for the order cap; never the
+    /// share's measure, so it sells every token whatever the measure made of
+    /// the look. At a skipped look the value read may be short, so the cap is
+    /// taken from no less than the Safe's tokens and the dollars read add up to.
+    pub fn halting(&self, looked: bool) -> Step {
+        if looked {
+            return self.next(true);
+        }
+        let mut picture = self.clone();
+        picture.value = self
+            .value
+            .max(accounted(&self.names, self.cash + self.safe_dollars));
+        picture.next(true)
     }
 
     /// The next step: the tradable token furthest from its weight, put back
@@ -383,7 +400,7 @@ mod tests {
 
     /// The share's measure, as the agent keeps it.
     fn measure() -> PerShare {
-        PerShare::new(config::DRAWDOWN_STOP, config::STOP_LIFTS_WITHIN)
+        PerShare::new(config::DRAWDOWN_STOP)
     }
 
     /// `picture` with the share's value and peak `per_share` has after it
@@ -428,21 +445,89 @@ mod tests {
     }
 
     #[test]
-    fn once_sold_out_the_stop_lifts_when_what_it_held_has_recovered() {
+    fn once_sold_out_after_the_stop_it_buys_nothing_until_a_restart() {
         let mut per_share = measure();
         looked(&mut per_share, at("0.2", "2500", "500"));
         // WETH down 25%: the share 12.5% down, stopped, and it sells out.
         assert!(looked(&mut per_share, at("0.2", "1875", "500")).stopped());
-        assert!(looked(&mut per_share, at("0", "1875", "875")).stopped());
-        // WETH up a little: still more than 5% under the peak, as if the
-        // WETH had been kept, so still stopped and still not buying.
-        let partly = looked(&mut per_share, at("0", "2000", "875"));
-        assert!(partly.stopped(), "lifted at share {}", partly.share);
-        assert_eq!(partly.next(false), Step::Nothing);
-        // WETH back to $2,500: the stop lifts, and it buys back in.
-        let back = looked(&mut per_share, at("0", "2500", "875"));
-        assert!(!back.stopped(), "still stopped at share {}", back.share);
-        assert!(matches!(back.next(false), Step::Buy { .. }));
+        let out = looked(&mut per_share, at("0", "1875", "875"));
+        assert!(out.stopped());
+        // WETH all the way back, and past its peak: none of it was held, so
+        // the share stays where the selling left it, and nothing is bought.
+        for price in ["2000", "2500", "3000"] {
+            let back = looked(&mut per_share, at("0", price, "875"));
+            assert!(back.stopped(), "lifted at ${price}, share {}", back.share);
+            assert_eq!(back.share, d("0.875"));
+            assert_eq!(back.next(false), Step::Nothing);
+        }
+        // A restart measures afresh: the vault as it is, at its weights.
+        let mut restarted = measure();
+        let fresh = looked(&mut restarted, at("0", "3000", "875"));
+        assert!(!fresh.stopped());
+        assert!(matches!(fresh.next(false), Step::Buy { .. }));
+    }
+
+    #[test]
+    fn a_market_swinging_after_the_stop_never_buys_back_in() {
+        let mut per_share = measure();
+        looked(&mut per_share, at("0.2", "2500", "500"));
+        // WETH down 25%: stopped, and it sells out at $1,875.
+        assert!(looked(&mut per_share, at("0.2", "1875", "500")).stopped());
+        let (mut weth, mut cash) = (zero(), d("875"));
+        looked(&mut per_share, holding(weth, "1875", cash));
+        for cycle in 0..3 {
+            // WETH rallies to $2,300, then falls back to $2,000. Whatever a
+            // step would buy is bought back to the weight at once.
+            for price in ["2300", "2000"] {
+                let now = looked(&mut per_share, holding(weth, price, cash));
+                assert!(now.stopped(), "cycle {cycle}: lifted at ${price}");
+                if let Step::Buy { .. } = now.next(false) {
+                    let bought = now.value / d("2") / d(price);
+                    cash -= bought * d(price);
+                    weth += bought;
+                }
+            }
+        }
+        let real = cash + weth * d("2000");
+        assert!(
+            real >= d("850"),
+            "the vault fell to ${real} from $1,000, the stop measuring {} of a peak of {}",
+            per_share.now,
+            per_share.peak
+        );
+        assert_eq!(real, d("875"));
+    }
+
+    /// The vault of [`base`] holding `weth` at `price`, and `cash`.
+    fn holding(weth: Decimal, price: &str, cash: Decimal) -> Picture {
+        let mut picture = base("0", "0");
+        picture.names[0].tokens = weth;
+        picture.names[0].feed_price = d(price);
+        picture.names[0].market_price = d(price);
+        picture.cash = cash;
+        picture.value = picture.names[0].worth() + cash;
+        picture
+    }
+
+    #[test]
+    fn a_halt_at_a_look_the_measure_skipped_still_sells_by_what_the_safe_holds() {
+        // The Safe's value went unread: the vault reads as its cash alone.
+        let mut skipped = base("0.2", "500");
+        skipped.value = d("500");
+        skipped.peak = d("2");
+        // Its order cap is 5% of the $1,000 it holds, not of the $500 read,
+        // and the share's measure (here far past the stop) plays no part.
+        assert!(
+            matches!(skipped.halting(false), Step::Sell { tokens, .. } if tokens == d("0.02")),
+            "{:?}",
+            skipped.halting(false)
+        );
+        // Read as nothing at all: still sells.
+        skipped.value = zero();
+        assert!(matches!(skipped.halting(false), Step::Sell { .. }));
+        // At a look taken, it is the halt's step as ever.
+        let taken = base("0.2", "500");
+        assert_eq!(taken.halting(true), taken.next(true));
     }
 
     #[test]
@@ -501,7 +586,6 @@ mod tests {
     #[test]
     fn each_manifest_claims_the_stop_as_a_fall_in_a_share_s_value() {
         assert_eq!(config::DRAWDOWN_STOP, "0.10");
-        assert_eq!(config::STOP_LIFTS_WITHIN, "0.05");
         for manifest in [
             include_str!("../shonin.toml"),
             include_str!("../base/shonin.toml"),
@@ -510,9 +594,14 @@ mod tests {
             assert!(manifest.contains("a fall from before a restart is not remembered"));
             assert!(!manifest.contains("fall from the vault's peak"));
             assert!(manifest.contains("couldn't be read"));
-            assert!(manifest.contains(
-                "as if the vault had kept what it held when the stop came, is back within 5% of its peak"
-            ));
+            assert!(manifest.contains("Sells everything only after a 10% fall"));
+            assert!(
+                manifest
+                    .contains("the stop holds until then, and a restart measures a share afresh")
+            );
+            assert!(manifest.contains("buys nothing until the agent restarts"));
+            assert!(!manifest.contains("Only sells after"));
+            assert!(!manifest.contains("lifts"));
         }
     }
 

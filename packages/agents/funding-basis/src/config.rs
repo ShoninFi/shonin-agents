@@ -28,14 +28,12 @@ pub const REBALANCE_BAND: &str = "0.10";
 
 /// Gross exposure at most twice the vault's value.
 pub const MAX_GROSS_LEVERAGE: &str = "2";
-/// No single order above 5% of the vault.
+/// No single order above 5% of the vault, save a halt's closing orders.
 pub const MAX_ORDER_FRACTION: &str = "0.05";
 /// 6% of the vault kept liquid, so an ordinary withdrawal closes nothing:
 /// a little above the vault's own 5% idle floor, which it never moves past.
 pub const IDLE_BUFFER: &str = "0.06";
-/// Only reduces after a 10% fall in a vault share's value from its peak since
-/// the agent last started, as it measures it (`per_share.rs`).
+/// Closes both legs after a 10% fall in a vault share's value from its peak
+/// since the agent last started, as it measures it (`per_share.rs`), and
+/// opens nothing more until the agent restarts.
 pub const DRAWDOWN_STOP: &str = "0.10";
-/// Once stopped, opens again only when a share, measured as if the vault had
-/// kept what it held when the stop came, is back within 5% of its peak.
-pub const STOP_LIFTS_WITHIN: &str = "0.05";

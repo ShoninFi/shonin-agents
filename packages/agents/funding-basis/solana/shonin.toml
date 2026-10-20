@@ -10,7 +10,7 @@ perpetual trades above the spot. Both legs sit at the stand-in venue on \
 Solana, in an account the vault's own station controls, which the trading key \
 can trade through but never withdraw from. When funding falls far enough it \
 unwinds, and when a vault share's value falls far enough from its peak it \
-only reduces.
+closes out.
 
 The edge is mechanical and it compresses as more capital chases it, which is \
 the honest thing to say about it: the record shows the size it was earned at, \
@@ -24,17 +24,16 @@ withdrawals never move it. \
 It starts again from a share's value at each start of the agent, so \
 a fall from before a restart is not remembered.
 
-Once stopped it only reduces, and from then on a share is \
-measured as if the vault had kept what it held when the stop came, since what \
-it no longer holds no longer moves: the stop lifts, and it may open again, once that \
-measure is back within 5% of its peak.
+Once stopped it closes both legs and opens nothing more: the stop holds \
+until the agent next starts, and a restart starts the measure afresh from a \
+share's value then.
 """
 claims = [
     "Gross exposure at most twice the vault's value",
-    "No single order above 5% of the vault",
+    "No single order above 5% of the vault, save a halt's closing orders",
     "6% of the vault kept liquid, so an ordinary withdrawal closes nothing",
-    "Only reduces after a 10% fall in a vault share's value from its peak since the agent last started, as it measures it from the marks and funding of both legs: deposits and withdrawals never count",
-    "Once stopped, opens again only when a vault share, measured as if the vault had kept what it held when the stop came, is back within 5% of its peak",
+    "Closes both legs after a 10% fall in a vault share's value from its peak since the agent last started, as it measures it from the marks and funding of both legs: deposits and withdrawals never count",
+    "Once stopped, opens nothing until the agent restarts: the stop holds until then, and a restart measures a share afresh from its value then",
     "One market, BTC against BTC-PERP, and nothing else",
 ]
 

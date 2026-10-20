@@ -22,8 +22,8 @@ free to read; nothing it reads is licensed or paid for.
 claims = [
     "Reads only the SEC's public filings for three companies: NVDA, TSLA and AAPL",
     "Long only: buys a stock token on a strong score and sells it later",
-    "No single order above 5% of the vault, and at most 30% of the vault in positions",
-    "Each position closed after a day, or sooner after a 3% fall from its entry",
+    "No single buy above 5% of the vault, each position one buy, and at most 30% of the vault in positions",
+    "Each position closed a day after its entry, or sooner after a 3% fall from its entry price; a position held when the agent restarts is entered afresh at the restart; every position sold when the vault halts",
     "6% of the vault kept liquid, so an ordinary withdrawal closes nothing",
 ]
 

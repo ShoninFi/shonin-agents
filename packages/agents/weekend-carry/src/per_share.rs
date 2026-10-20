@@ -13,11 +13,10 @@
 //! and a move divided by a value read short would count many times over.
 //!
 //! Once a share has fallen by the stop from its peak, the agent is stopped,
-//! and sells what the stop has it sell. From then on, since what it sold no
-//! longer moves, a share is measured as if the vault had kept what it held
-//! at the look that stopped it. The stop lifts once that measure is back
-//! within a smaller fall of the peak, so the agent buys back in only after
-//! what it held has recovered most of the fall.
+//! and the stop holds until the agent next starts: nothing lifts it. The
+//! measure goes on following what the vault actually holds, so once sold
+//! out it stays where the selling left it. A restart starts the measure,
+//! and the stop with it, afresh.
 
 use strategy_sdk::{Decimal, decimal};
 
@@ -38,41 +37,36 @@ pub struct Held {
 }
 
 /// The value of a vault share as a multiple of its value when the agent
-/// started, the highest it has been since, and whether the stop holds.
+/// started, the highest it has been since, and whether the stop has come.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PerShare {
     pub now: Decimal,
     pub peak: Decimal,
     /// The fall from the peak, as a fraction of it, that stops the agent.
     stop: Decimal,
-    /// The fall from the peak, as a fraction of it, within which the
-    /// measure must be back for the stop to lift.
-    lift: Decimal,
+    /// The stop came at a look since the agent started.
+    stopped: bool,
     /// The last look taken: the vault's value, and what it held.
     last: Option<(Decimal, Vec<Held>)>,
-    /// While stopped: what the vault held at the look that stopped it, and
-    /// what that would be worth now with the vault's value then.
-    kept: Option<(Decimal, Vec<Held>)>,
 }
 
 impl PerShare {
     /// A share measured from one, stopped by a fall of `stop` from its peak
-    /// and lifted once back within `lift` of it (fractions of the peak).
-    pub fn new(stop: &str, lift: &str) -> Self {
+    /// (a fraction of the peak).
+    pub fn new(stop: &str) -> Self {
         Self {
             now: Decimal::from(1u8),
             peak: Decimal::from(1u8),
             stop: decimal(stop),
-            lift: decimal(lift),
+            stopped: false,
             last: None,
-            kept: None,
         }
     }
 
-    /// Whether the stop holds: a share fell by the stop from its peak, and
-    /// hasn't come back within the lift of it since.
+    /// Whether the stop holds: a share fell by the stop from its peak at a
+    /// look since the agent started. Only a restart clears it.
     pub fn stopped(&self) -> bool {
-        self.kept.is_some()
+        self.stopped
     }
 
     /// Take a look at the vault: worth `value` in all as its accounts read,
@@ -83,7 +77,6 @@ impl PerShare {
     /// look counts from the last one taken. Says whether it was taken.
     pub fn look(&mut self, value: Decimal, accounted: Option<Decimal>, held: Vec<Held>) -> bool {
         let zero = Decimal::from(0u8);
-        let one = Decimal::from(1u8);
         let Some(accounted) = accounted else {
             return false;
         };
@@ -95,42 +88,23 @@ impl PerShare {
         if value <= zero || gap > value * decimal(ACCOUNTED_WITHIN) {
             return false;
         }
-        let moved = |then: &[Held]| {
-            then.iter().fold(zero, |sum, old| {
+        if let Some((before, then)) = &self.last
+            && *before > zero
+        {
+            let moved = then.iter().fold(zero, |sum, old| {
                 match held.iter().find(|new| new.what == old.what) {
                     Some(new) => sum + old.quantity * (new.unit_value - old.unit_value),
                     None => sum,
                 }
-            })
-        };
-        let grown = match (&mut self.kept, &self.last) {
-            (Some((worth, kept)), _) => {
-                let made = moved(kept);
-                let grown = (*worth > zero).then(|| self.now * (one + made / *worth));
-                *worth += made;
-                for old in kept.iter_mut() {
-                    if let Some(new) = held.iter().find(|new| new.what == old.what) {
-                        old.unit_value = new.unit_value;
-                    }
-                }
-                grown
-            }
-            (None, Some((before, then))) if *before > zero => {
-                Some(self.now * (one + moved(then) / *before))
-            }
-            _ => None,
-        };
-        if let Some(grown) = grown {
+            });
+            let grown = self.now * (Decimal::from(1u8) + moved / *before);
             self.now = if grown > zero { grown } else { zero };
             if self.now > self.peak {
                 self.peak = self.now;
             }
         }
-        let fallen = self.peak - self.now;
-        if self.kept.is_none() && fallen >= self.peak * self.stop {
-            self.kept = Some((value, held.clone()));
-        } else if self.kept.is_some() && fallen <= self.peak * self.lift {
-            self.kept = None;
+        if self.peak - self.now >= self.peak * self.stop {
+            self.stopped = true;
         }
         self.last = Some((value, held));
         true
@@ -150,7 +124,7 @@ mod tests {
     }
 
     fn share() -> PerShare {
-        PerShare::new("0.10", "0.05")
+        PerShare::new("0.10")
     }
 
     /// A look whose holdings account for its value exactly.
@@ -198,23 +172,27 @@ mod tests {
     }
 
     #[test]
-    fn once_stopped_a_share_moves_with_what_was_held_and_the_stop_lifts_near_the_peak() {
+    fn once_stopped_the_stop_holds_and_the_share_follows_only_what_the_vault_holds() {
         let mut share = share();
         look(&mut share, "1000", vec![held("A", "2", "250")]);
         // A down 25%: the share 12.5% down, stopped.
         look(&mut share, "875", vec![held("A", "2", "187.5")]);
         assert!(share.stopped());
-        // Sold out: nothing held moves, but the measure follows A as held.
+        // Sold out: A's recovery is no gain of the vault's, so the share
+        // stays where the selling left it, and the stop holds.
         look(&mut share, "875", vec![held("A", "0", "187.5")]);
-        look(&mut share, "875", vec![held("A", "0", "200")]);
-        assert!(share.stopped(), "back to {} only", share.now);
-        // A back where it was: the share would be whole again; lifted.
         look(&mut share, "875", vec![held("A", "0", "250")]);
-        assert!(share.now > decimal("0.9999"), "{}", share.now);
+        look(&mut share, "875", vec![held("A", "0", "400")]);
+        assert_eq!(share.now, decimal("0.875"));
+        assert!(share.stopped());
+        // Even a share back above its peak doesn't lift it.
+        look(&mut share, "875", vec![held("A", "1", "400")]);
+        look(&mut share, "1075", vec![held("A", "1", "600")]);
+        assert!(share.now > share.peak * decimal("0.95"), "{}", share.now);
+        assert!(share.stopped());
+        // A restart starts the measure, and the stop, afresh.
+        let share = PerShare::new("0.10");
         assert!(!share.stopped());
-        // From here on, what the vault holds moves it again.
-        look(&mut share, "875", vec![held("A", "1", "250")]);
-        look(&mut share, "885", vec![held("A", "1", "260")]);
-        assert!(share.now > decimal("1"));
+        assert_eq!(share.now, decimal("1"));
     }
 }
