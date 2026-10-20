@@ -18,12 +18,13 @@ pub const READ_EVERY: u64 = 300;
 pub const MODEL: &str = "scorer";
 pub const BUY_SCORE: &str = "0.60";
 
-/// Each position at most this much of the vault, and all of them together
-/// at most `MAX_EXPOSURE`.
+/// Each buy at most this much of the vault, each position one buy, and all
+/// of them together at most `MAX_EXPOSURE`.
 pub const MAX_ORDER_FRACTION: &str = "0.05";
 pub const MAX_EXPOSURE: &str = "0.30";
-/// Held at most this long, in seconds, and closed sooner after this fall
-/// from its entry price.
+/// Held at most this long from its entry, in seconds, and closed sooner
+/// after this fall from its entry price. A position held when the agent
+/// starts is entered at the start.
 pub const HOLD_FOR: u64 = 86_400;
 pub const STOP_LOSS: &str = "0.03";
 /// How far from the price seen a swap may fill.

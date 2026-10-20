@@ -46,12 +46,10 @@ pub const SLIPPAGE: &str = "0.01";
 pub const MAX_POOL_GAP: &str = "0.02";
 /// 6% of the vault kept liquid, so an ordinary withdrawal closes nothing.
 pub const IDLE_BUFFER: &str = "0.06";
-/// Only sells after a 10% fall in a vault share's value from its peak since
-/// the agent last started, as it measures it (`per_share.rs`).
+/// Sells everything after a 10% fall in a vault share's value from its peak
+/// since the agent last started, as it measures it (`per_share.rs`), and
+/// buys nothing more until the agent restarts.
 pub const DRAWDOWN_STOP: &str = "0.10";
-/// Once stopped, buys back in only when a share, measured as if the vault
-/// had kept what it held when the stop came, is back within 5% of its peak.
-pub const STOP_LIFTS_WITHIN: &str = "0.05";
 
 /// Looks at most this often, in seconds.
 pub const STEP_EVERY: u64 = 60;

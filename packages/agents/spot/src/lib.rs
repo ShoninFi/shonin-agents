@@ -66,7 +66,7 @@ impl sdk::Agent for Spot {
             .ok_or_else(|| format!("this agent trades on no venue on {home}"))?;
         let mut mind = Mind {
             venue,
-            per_share: PerShare::new(config::DRAWDOWN_STOP, config::STOP_LIFTS_WITHIN),
+            per_share: PerShare::new(config::DRAWDOWN_STOP),
             last_step: 0,
         };
         let ticks = clock(venue)?;
@@ -289,9 +289,10 @@ async fn submit(venue: &config::Venue, action: &venues::Action) -> Result<bool, 
 /// home: a halt is an unwind with less time.
 async fn flatten(mind: &mut Mind) -> Result<(), String> {
     for _ in 0..FLATTEN_STEPS {
-        // A halt sells whatever the measure makes of the look.
-        let (picture, _) = picture(mind).await?;
-        let step = picture.next(true);
+        // A halt acts on a look the measure skipped too: see
+        // `Picture::halting`.
+        let (picture, looked) = picture(mind).await?;
+        let step = picture.halting(looked);
         if step == Step::Nothing || !act(mind.venue, &picture, step).await? {
             break;
         }

@@ -211,7 +211,7 @@ pub fn wakes_for(event: &[u8]) -> bool {
 }
 
 /// Whether a vault share's value has fallen far enough from its peak (see
-/// [`PerShare`]), now or at an earlier look the stop hasn't lifted since,
+/// [`PerShare`]), now or at any earlier look since the agent started,
 /// that this strategy should stop opening anything and only get smaller.
 pub fn only_reducing(share: &PerShare, limits: &Limits) -> bool {
     share.stopped()
@@ -839,7 +839,7 @@ mod tests {
     fn plan(state: &AccountState, quotes: &Quotes) -> Plan {
         decide(
             &limits(),
-            &PerShare::new(config::DRAWDOWN_STOP, config::STOP_LIFTS_WITHIN),
+            &PerShare::new(config::DRAWDOWN_STOP),
             zero(),
             state,
             quotes,
@@ -1092,7 +1092,7 @@ mod tests {
         *perp_size(&mut before) = d("-400");
         revalue(&mut before);
         let quotes = quotes(ABOVE_ENTRY);
-        let mut share = PerShare::new(config::DRAWDOWN_STOP, config::STOP_LIFTS_WITHIN);
+        let mut share = PerShare::new(config::DRAWDOWN_STOP);
         share.look(
             before.vault_value,
             Some(before.vault_value),
@@ -1123,7 +1123,7 @@ mod tests {
         balance(&mut held_now, config::SPOT_TOKEN).total = d("400");
         *perp_size(&mut held_now) = d("-400");
         revalue(&mut held_now);
-        let mut share = PerShare::new(config::DRAWDOWN_STOP, config::STOP_LIFTS_WITHIN);
+        let mut share = PerShare::new(config::DRAWDOWN_STOP);
         share.look(
             held_now.vault_value,
             Some(held_now.vault_value),
@@ -1172,7 +1172,7 @@ mod tests {
         let decided = |state: &AccountState, leavers: &Leavers| {
             decide(
                 &limits(),
-                &PerShare::new(config::DRAWDOWN_STOP, config::STOP_LIFTS_WITHIN),
+                &PerShare::new(config::DRAWDOWN_STOP),
                 leavers.held(),
                 state,
                 &quotes(ABOVE_ENTRY),

@@ -64,7 +64,7 @@ fn now() -> u64 {
 impl sdk::Agent for WeekendCarry {
     async fn run() -> Result<(), String> {
         let mut mind = Mind {
-            per_share: PerShare::new(config::DRAWDOWN_STOP, config::STOP_LIFTS_WITHIN),
+            per_share: PerShare::new(config::DRAWDOWN_STOP),
             books: HashMap::new(),
             last_step: 0,
         };
@@ -153,7 +153,7 @@ fn same(one: &Account, other: &Account) -> bool {
 /// none when one of its accounts couldn't be read, since the balances leave
 /// such an account out rather than read it as empty, or when Lighter holds
 /// something and its positions (`perps_read`) couldn't be read.
-async fn vault_value(holdings: &rh::AccountState, perps_read: bool) -> (Decimal, Option<Decimal>) {
+async fn vault_value(holdings: &rh::AccountState, perps_read: bool) -> Value {
     let balances = transfers::balances().await;
     let dollars = |amount: u64| Decimal::from(amount) / Decimal::from(1_000_000u32);
     let total = dollars(balances.iter().map(|balance| balance.amount).sum());
@@ -163,23 +163,49 @@ async fn vault_value(holdings: &rh::AccountState, perps_read: bool) -> (Decimal,
             .find(|balance| same(&balance.account, account))
             .map(|balance| dollars(balance.amount))
     };
+    let in_safe = holdings
+        .holdings
+        .iter()
+        .fold(holdings.dollars, |sum, held| {
+            sum + held.tokens * held.feed_price
+        });
+    let least = match read(&venue(rh::DRIVER)) {
+        Some(_) => total,
+        None => total + in_safe,
+    };
+    let shorts_known =
+        perps_read || matches!(read(&venue(lt::DRIVER)), Some(perps) if perps <= zero());
     let accounted = match (
         read(&Account::Vault),
         read(&Account::Station(transfers::home_chain())),
         read(&venue(rh::DRIVER)),
         read(&venue(lt::DRIVER)),
     ) {
-        (Some(cash), Some(idle), Some(_), Some(perps)) if perps_read || perps <= zero() => Some(
-            holdings
-                .holdings
-                .iter()
-                .fold(cash + idle + perps + holdings.dollars, |sum, held| {
-                    sum + held.tokens * held.feed_price
-                }),
-        ),
+        (Some(cash), Some(idle), Some(_), Some(perps)) if perps_read || perps <= zero() => {
+            Some(cash + idle + perps + in_safe)
+        }
         _ => None,
     };
-    (total, accounted)
+    Value {
+        total,
+        accounted,
+        least,
+        shorts_known,
+    }
+}
+
+/// The vault's value, as [`vault_value`] reads it.
+struct Value {
+    /// Everything the vault is worth, everywhere, in dollars.
+    total: Decimal,
+    /// What its holdings say it is worth: none when they can't say.
+    accounted: Option<Decimal>,
+    /// The least it is surely worth: every account read, and the Safe by
+    /// what it holds when its own balance went unread.
+    least: Decimal,
+    /// What it is short is known: Lighter's positions read, or Lighter's
+    /// balance read as nothing.
+    shorts_known: bool,
 }
 
 async fn state<Q: serde::Serialize, A: serde::de::DeserializeOwned>(
@@ -197,7 +223,12 @@ async fn picture(mind: &mut Mind) -> Result<(Picture, bool), String> {
     let holdings: rh::AccountState = state(rh::DRIVER, &rh::Query::Holdings).await?;
     // No Lighter account before the first move to it: nothing is held there.
     let perps: Option<lt::AccountState> = state(lt::DRIVER, &lt::Query::Account).await.ok();
-    let (value, accounted) = vault_value(&holdings, perps.is_some()).await;
+    let Value {
+        total: value,
+        accounted,
+        least,
+        shorts_known,
+    } = vault_value(&holdings, perps.is_some()).await;
     let mut names = Vec::new();
     for (token, perp, market) in config::NAMES {
         let Some(price) = prices.iter().find(|p| p.token == *token) else {
@@ -238,6 +269,8 @@ async fn picture(mind: &mut Mind) -> Result<(Picture, bool), String> {
             share: mind.per_share.now,
             peak: mind.per_share.peak,
             stop_holds: mind.per_share.stopped(),
+            least_value: least,
+            shorts_known,
             names,
         },
         looked,
@@ -384,12 +417,12 @@ async fn submit<A: serde::Serialize>(driver: &str, action: &A) -> Result<bool, S
 /// time.
 async fn flatten(mind: &mut Mind) -> Result<(), String> {
     for _ in 0..FLATTEN_STEPS {
-        // A halt closes whatever the measure makes of the look.
-        let (mut picture, _) = picture(mind).await?;
-        // A halt closes regardless of the weekend or the premium: as if the
-        // peak were far above.
-        picture.peak = picture.share * Decimal::from(10u8);
-        match picture.next() {
+        // A halt acts on a look the measure skipped too: see
+        // `Picture::halting`.
+        let (picture, looked) = picture(mind).await?;
+        match picture.halting(looked) {
+            // The shorts unread: look again rather than leave them open.
+            Step::Nothing if !picture.shorts_known => continue,
             Step::Nothing => return Ok(()),
             close @ Step::Close { .. } => act(&picture, close).await?,
             Step::Open { .. } => return Ok(()),

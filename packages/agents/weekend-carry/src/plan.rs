@@ -83,9 +83,16 @@ pub struct Picture {
     /// [`PerShare`](crate::per_share::PerShare)).
     pub share: Decimal,
     pub peak: Decimal,
-    /// The stop came at an earlier look and hasn't lifted since (see
-    /// [`PerShare`](crate::per_share::PerShare)).
+    /// The stop came at a look since the agent started: it holds until the
+    /// agent restarts (see [`PerShare`](crate::per_share::PerShare)).
     pub stop_holds: bool,
+    /// The least the vault is surely worth, from the accounts that read
+    /// (see `vault_value`): at a look the measure skipped, `vault_value` may
+    /// be read short of it.
+    pub least_value: Decimal,
+    /// What the vault is short is known: Lighter's positions were read, or
+    /// Lighter holds nothing.
+    pub shorts_known: bool,
     pub names: Vec<Name>,
 }
 
@@ -137,7 +144,7 @@ pub fn held(names: &[Name]) -> Vec<Held> {
 
 impl Picture {
     /// Whether a vault share's value has fallen by the stop from its peak,
-    /// now or at an earlier look the stop hasn't lifted since.
+    /// now or at any earlier look since the agent started.
     pub fn only_reducing(&self) -> bool {
         self.stop_holds
             || (self.peak > zero()
@@ -149,6 +156,26 @@ impl Picture {
             .iter()
             .map(|name| name.tokens * name.token_price + abs(name.perp_position) * name.perp_ask)
             .fold(zero(), |a, b| a + b)
+    }
+
+    /// The next step of a halt, at a look the share's measure took or
+    /// skipped (`looked`): a close wherever anything is carried, whatever the
+    /// weekend, the premium or the share's measure. It reads what the Safe
+    /// holds, Lighter's positions, the prices and books, and the vault's value
+    /// for the order cap. At a skipped look the value read may be short, so
+    /// the cap is taken from no less than [`Picture::least_value`]. While the shorts aren't known nothing is
+    /// closed, since selling a token whose short is still open would leave
+    /// the short naked.
+    pub fn halting(&self, looked: bool) -> Step {
+        if !self.shorts_known {
+            return Step::Nothing;
+        }
+        let mut picture = self.clone();
+        picture.stop_holds = true;
+        if !looked {
+            picture.vault_value = self.vault_value.max(self.least_value);
+        }
+        picture.next()
     }
 
     /// The next step: a close first wherever one is due, else an opening
@@ -255,6 +282,8 @@ mod tests {
             share: decimal("1"),
             peak: decimal("1"),
             stop_holds: false,
+            least_value: zero(),
+            shorts_known: true,
             names,
         }
     }
@@ -339,15 +368,15 @@ mod tests {
         assert!(!manifest.contains("fall from the vault's peak"));
         assert!(manifest.contains("couldn't be read"));
         assert!(
-            manifest.contains(
-                "as if the vault had kept what it held when the stop came, is back within 5% of its peak"
-            ) && config::STOP_LIFTS_WITHIN == "0.05"
+            manifest.contains("the stop holds until then, and a restart measures a share afresh")
         );
+        assert!(manifest.contains("opens nothing until the agent restarts"));
+        assert!(!manifest.contains("lifts"));
     }
 
     /// The share's measure, as the agent keeps it.
     fn measure() -> crate::per_share::PerShare {
-        crate::per_share::PerShare::new(config::DRAWDOWN_STOP, config::STOP_LIFTS_WITHIN)
+        crate::per_share::PerShare::new(config::DRAWDOWN_STOP)
     }
 
     /// `p` with the share's value, peak and stop `per_share` has after a
@@ -383,7 +412,7 @@ mod tests {
     }
 
     #[test]
-    fn once_both_legs_are_cut_the_stop_lifts_when_the_pair_has_recovered() {
+    fn once_both_legs_are_cut_the_stop_holds_whatever_the_pair_does_after() {
         let mut per_share = measure();
         let mut carry = spy("710");
         carry.tokens = decimal("100");
@@ -395,21 +424,48 @@ mod tests {
         let mut cut = picture(SATURDAY, vec![carry.clone()]);
         cut.vault_value = decimal("89000");
         assert!(looked(&mut per_share, cut.clone()).only_reducing());
-        // Both legs cut: nothing held moves, the pair as held still does.
+        // Both legs cut: nothing held moves.
         carry.tokens = zero();
         carry.perp_position = zero();
         cut.names = vec![carry.clone()];
-        assert!(looked(&mut per_share, cut.clone()).only_reducing());
-        // The gap closes again: the pair as held is back where it was.
-        carry.perp_bid = decimal("710");
-        carry.perp_ask = decimal("710.05");
-        cut.names = vec![carry];
-        let back = looked(&mut per_share, cut);
-        assert!(
-            !back.only_reducing(),
-            "still stopped at share {}",
-            back.share
-        );
+        let share = looked(&mut per_share, cut.clone()).share;
+        // The gap closes again, wide enough to open on: the pair wasn't
+        // held, so the share stays where the cut left it, and nothing opens.
+        for bid in ["710", "760", "710"] {
+            carry.perp_bid = decimal(bid);
+            carry.perp_ask = decimal(bid) + decimal("0.05");
+            cut.names = vec![carry.clone()];
+            let now = looked(&mut per_share, cut.clone());
+            assert!(now.only_reducing(), "lifted at {bid}, share {}", now.share);
+            assert_eq!(now.share, share);
+            assert_eq!(now.next(), Step::Nothing, "at {bid}");
+        }
+        // A restart measures afresh, and may open again.
+        let mut restarted = measure();
+        assert!(!looked(&mut restarted, cut).only_reducing());
+    }
+
+    #[test]
+    fn a_halt_closes_at_a_skipped_look_but_never_sells_a_token_whose_short_is_unknown() {
+        let mut carry = spy("710");
+        carry.tokens = decimal("100");
+        carry.perp_position = decimal("-100");
+        // A look the measure skipped: the vault's value read as nothing,
+        // though the Safe's holdings say it holds at least $70,000.
+        let mut skipped = picture(SATURDAY, vec![carry]);
+        skipped.vault_value = zero();
+        skipped.least_value = decimal("70000");
+        // The cap comes from the $70,000: $3,500, about 4 shares.
+        let Step::Close { shares, .. } = skipped.halting(false) else {
+            panic!("{:?}", skipped.halting(false))
+        };
+        assert!(shares > zero() && shares < decimal("5"), "{shares}");
+        // A halt closes outside the weekend and at any premium too.
+        skipped.now = SATURDAY + 4 * 86_400;
+        assert!(matches!(skipped.halting(false), Step::Close { .. }));
+        // Lighter's positions unread: nothing closes, not even the token.
+        skipped.shorts_known = false;
+        assert_eq!(skipped.halting(false), Step::Nothing);
     }
 
     #[test]

@@ -25,18 +25,19 @@ It starts again from a share's value at each start of the agent, so \
 a fall from before a restart is not remembered.
 
 A look at which one of the vault's accounts couldn't be read, or whose \
-accounts don't add up to what it holds, is skipped: nothing is decided from \
-it, and a share's value doesn't move. Once stopped it only closes, and from then on a share is \
-measured as if the vault had kept what it held when the stop came, since what \
-it no longer holds no longer moves: the stop lifts, and it may open again, once that \
-measure is back within 5% of its peak.
+accounts don't add up to what it holds, is skipped: a share's value doesn't \
+move, and no step is decided from it, save a halt's, which closes what the \
+vault holds whatever the measure made of the look, but never sells a token \
+while what is shorted against it can't be read. Once stopped it closes \
+both legs and opens nothing more: the stop holds until the agent next \
+starts, and a restart starts the measure afresh from a share's value then.
 """
 claims = [
     "Gross exposure at most twice the vault's value",
     "No single order above 5% of the vault",
     "Three underlyings only: SPY, QQQ and NVDA, as stock tokens and as Lighter perpetuals",
     "Both legs cut together after a 10% fall in a vault share's value from its peak since the agent last started, as it measures it from the tokens' Chainlink prices and the perpetuals' books: deposits and withdrawals never count",
-    "Once cut, opens again only when a vault share, measured as if the vault had kept what it held when the stop came, is back within 5% of its peak",
+    "Once cut, opens nothing until the agent restarts: the stop holds until then, and a restart measures a share afresh from its value then",
     "Unwinds the perpetual first and the token second, never leaving a naked short",
     "6% of the vault kept liquid, so an ordinary withdrawal closes nothing",
 ]

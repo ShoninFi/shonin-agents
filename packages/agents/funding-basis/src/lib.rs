@@ -67,7 +67,7 @@ impl Mind {
         Self {
             settings: Settings::shipped(),
             limits: limits(),
-            per_share: PerShare::new(config::DRAWDOWN_STOP, config::STOP_LIFTS_WITHIN),
+            per_share: PerShare::new(config::DRAWDOWN_STOP),
             patience: Patience::default(),
             leavers: Leavers::default(),
         }
@@ -359,10 +359,11 @@ mod tests {
         assert!(manifest.contains("a fall from before a restart is not remembered"));
         assert!(!manifest.contains("fall from the vault's peak"));
         assert!(
-            manifest.contains(
-                "as if the vault had kept what it held when the stop came, is back within 5% of its peak"
-            ) && config::STOP_LIFTS_WITHIN == "0.05"
+            manifest.contains("the stop holds until then, and a restart measures a share afresh")
         );
+        assert!(manifest.contains("opens nothing until the agent restarts"));
+        assert!(manifest.contains("save a halt's closing orders"));
+        assert!(!manifest.contains("lifts") && !manifest.contains("Only reduces"));
         assert!(manifest.contains(config::SPOT) && manifest.contains(config::PERP));
     }
 }
