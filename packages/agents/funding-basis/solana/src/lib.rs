@@ -73,6 +73,10 @@ struct Mind {
     /// After a read that failed, the agent looks again no sooner than this
     /// (seconds since the Unix epoch).
     looks_again_at: u64,
+    /// Cash was brought home for leavers and no look has read the vault
+    /// since: the next look that reads records it, however many are skipped
+    /// before it.
+    home_unrecorded: bool,
 }
 
 impl Mind {
@@ -84,6 +88,7 @@ impl Mind {
             patience: Patience::default(),
             leavers: Leavers::default(),
             looks_again_at: 0,
+            home_unrecorded: false,
         }
     }
 }
@@ -171,13 +176,15 @@ fn venue(host: &impl Host) -> Account {
 
 /// Look at what is there, work out what should be there, and act on it if
 /// that is worth a transaction. `brought_home` says cash has just come home
-/// for leavers.
+/// for leavers, which the first look that reads records, if this one is
+/// skipped.
 ///
 /// A read that fails skips the look, and is no fault: a fault ends `run`,
 /// and the platform starts the agent again with its measure, and the stop
 /// with it, afresh. The agent looks again at the first wake
 /// `LOOKS_AGAIN_AFTER` on.
 async fn step(host: &impl Host, mind: &mut Mind, brought_home: bool) -> Result<(), String> {
+    mind.home_unrecorded |= brought_home;
     if host.now() < mind.looks_again_at {
         return Ok(());
     }
@@ -196,7 +203,8 @@ async fn step(host: &impl Host, mind: &mut Mind, brought_home: bool) -> Result<(
         Some(state.vault_value),
         decide::held(&state),
     );
-    if brought_home {
+    if mind.home_unrecorded {
+        mind.home_unrecorded = false;
         mind.leavers.brought_home(&mind.limits, &state);
     } else {
         mind.leavers.seen(state.idle);
@@ -319,8 +327,10 @@ async fn carry_out(
 /// Close everything, the short first, because a halt is an unwind with less
 /// time. The order cap is lifted: the vault is stopping, and leaving a leg on
 /// would cost its depositors more than a wider fill will. A read that fails
-/// is looked again at after a pause, within the same bound of looks, rather
-/// than ending the agent.
+/// is looked again at after a pause, within the same bound of looks; if the
+/// looks run out with the last of them unread, the halt ends with an error
+/// rather than as wound down, so the platform starts the agent again within
+/// the halt's grace.
 async fn flatten(
     host: &impl Host,
     mind: &Mind,
@@ -331,17 +341,20 @@ async fn flatten(
         ..mind.limits
     };
     let zero = Decimal::from(0);
+    let mut unread = None;
     for _ in 0..FLATTEN_STEPS {
         let state = match read_state(host).await {
             Ok(state) => state,
             Err(error) => {
                 host.note(&format!("halt's look skipped: a read failed: {error}"));
+                unread = Some(error);
                 if !pause(host, waking, config::LOOKS_AGAIN_AFTER).await {
                     break;
                 }
                 continue;
             }
         };
+        unread = None;
         if state.position(&mind.settings.spot) == zero
             && state.position(&mind.settings.perp) == zero
         {
@@ -351,6 +364,11 @@ async fn flatten(
             perp: unwind(&mind.settings, &limits, &state),
         };
         carry_out(host, &mind.settings, &limits, &state, &plan).await;
+    }
+    if let Some(error) = unread {
+        // What is held is unknown: not wound down, so the platform starts
+        // the agent again to close the rest within the halt's grace.
+        return Err(format!("the halt could not read what is held: {error}"));
     }
     // The market would not take it inside the limits. The contract closes the
     // rest through the same reduce-only path, so stopping here is safe.
@@ -437,12 +455,15 @@ mod tests {
         assert!(manifest.contains("a fall from before a restart is not remembered"));
         assert!(!manifest.contains("fall from the vault's peak"));
         assert!(manifest.contains(
-            "the stop holds until then, a read that fails never restarts it, and a restart \
-             measures a share afresh"
+            "the stop holds until then, a read that fails outside a halt never restarts it, \
+             and a restart measures a share afresh"
         ));
         assert!(manifest.contains("opens nothing until the platform restarts the agent"));
         assert!(manifest.contains("the stop is cleared when the platform restarts"));
         assert!(manifest.contains("A read that fails is a look skipped"));
+        assert!(manifest.contains("a handover to another executor"));
+        assert!(manifest.contains("tank topped up after running dry"));
+        assert!(manifest.contains("read what the vault holds ends in error rather than as done"));
         assert!(manifest.contains("save a halt's closing orders"));
         assert!(!manifest.contains("lifts") && !manifest.contains("Only reduces"));
         assert!(manifest.contains(config::SPOT) && manifest.contains(config::PERP));
@@ -666,6 +687,45 @@ mod tests {
             log.iter()
                 .all(|sent| matches!(sent, Some(order) if order.reduce_only)),
             "added within the halt"
+        );
+    }
+
+    fn fake(failing: u32) -> Fake {
+        Fake {
+            clock: std::cell::Cell::new(1_000_000),
+            state: std::cell::RefCell::new(account("85000", "15000", "0.8", "50000")),
+            failing: std::cell::Cell::new(failing),
+            sent: std::cell::Cell::new(0),
+            log: std::cell::RefCell::new(Vec::new()),
+        }
+    }
+
+    #[test]
+    fn a_halt_that_cannot_read_what_is_held_never_ends_as_wound_down() {
+        let host = fake(u32::MAX);
+        let mind = super::Mind::new();
+        let mut waking = futures::stream::iter(
+            std::iter::repeat_with(|| super::Woke::Venue(Vec::new())).take(10_000),
+        );
+        let ended = futures::executor::block_on(super::flatten(&host, &mind, &mut waking));
+        assert!(ended.is_err(), "ended as wound down without reading");
+        assert_eq!(host.sent.get(), 0);
+    }
+
+    #[test]
+    fn cash_brought_home_while_looks_are_skipped_is_held_for_leavers_at_the_next_look() {
+        let host = fake(1);
+        let mut mind = super::Mind::new();
+        // A read fails, and cash comes home for leavers within the pause
+        // after it, so neither look reads the vault.
+        look(&host, &mut mind);
+        futures::executor::block_on(super::step(&host, &mut mind, true)).unwrap();
+        assert_eq!(mind.leavers.held(), decimal("0"));
+        host.clock.set(host.clock.get() + config::LOOKS_AGAIN_AFTER);
+        look(&host, &mut mind);
+        assert!(
+            mind.leavers.held() > decimal("0"),
+            "the cash brought home for leavers was forgotten"
         );
     }
 }

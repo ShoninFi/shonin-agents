@@ -38,3 +38,8 @@ pub const INVENTORY_CAP: &str = "0.50";
 /// The venue refuses an order under ten dollars; below this a quote isn't
 /// posted.
 pub const MINIMUM_NOTIONAL: &str = "12";
+
+/// During a halt, a look that couldn't close what it saw (a read failed, an
+/// order still rests, no book seen yet, or a close the venue didn't fill) is
+/// taken again no sooner than this, in seconds.
+pub const HALT_LOOKS_AGAIN_AFTER: u64 = 10;

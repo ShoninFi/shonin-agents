@@ -18,7 +18,8 @@ mod host;
 mod per_share;
 
 use decide::{
-    Leavers, Patience, Plan, Quotes, Snapshot, Top, hedge, held, limits, spot_dollars, trim, unwind,
+    Leavers, Patience, Plan, Quotes, Snapshot, Top, hedge, held, limits, spot_dollars, trim,
+    unpriced, unwind,
 };
 use futures::stream::PollNext;
 use futures::{Stream, StreamExt};
@@ -71,6 +72,10 @@ struct Mind {
     /// After a read that failed, the agent looks again no sooner than this
     /// (seconds since the Unix epoch).
     looks_again_at: u64,
+    /// Cash was brought home for leavers and no look has read the vault
+    /// since: the next look that reads records it, however many are skipped
+    /// before it.
+    home_unrecorded: bool,
 }
 
 impl Mind {
@@ -85,6 +90,7 @@ impl Mind {
             patience: Patience::default(),
             leavers: Leavers::default(),
             looks_again_at: 0,
+            home_unrecorded: false,
         }
     }
 }
@@ -223,13 +229,15 @@ fn venue(host: &impl Host) -> Account {
 
 /// Look at what is there, work out what should be there, and act on it if
 /// that is worth doing. `brought_home` says cash has just come home for
-/// leavers.
+/// leavers, which the first look that reads records, if this one is
+/// skipped.
 ///
 /// A read that fails skips the look, and is no fault: a fault ends `run`,
 /// and the platform starts the agent again with its measure, and the stop
 /// with it, afresh. The agent looks again at the first wake
 /// `LOOKS_AGAIN_AFTER` on.
 async fn step(host: &impl Host, mind: &mut Mind, brought_home: bool) -> Result<(), String> {
+    mind.home_unrecorded |= brought_home;
     if host.now() < mind.looks_again_at {
         return Ok(());
     }
@@ -246,7 +254,8 @@ async fn step(host: &impl Host, mind: &mut Mind, brought_home: bool) -> Result<(
     // its value is what its holdings account for.
     mind.per_share
         .look(state.vault_value, Some(state.vault_value), holdings);
-    if brought_home {
+    if mind.home_unrecorded {
+        mind.home_unrecorded = false;
         mind.leavers.brought_home(&mind.limits, &state);
     } else {
         mind.leavers.seen(state.idle);
@@ -388,8 +397,17 @@ async fn carry_out(
 
 /// Close everything, perp first, because a halt is an unwind with less time.
 /// The per-order cap is lifted: leaving a leg on would cost the depositors
-/// more than a wider fill. A read that fails is looked again at after a
-/// pause, within the same bound of looks, rather than ending the agent.
+/// more than a wider fill.
+///
+/// It closes nothing it would have to guess the price of: while a read
+/// fails, or a leg held has no quote yet (an agent started again within a
+/// halt has heard none), it waits, keeping the quotes that arrive meanwhile,
+/// and closes what it can price; a close the venue refuses is tried again
+/// after the same pause. It ends cleanly only once nothing is left to close,
+/// or the market would not take the closes; if the looks run out with a leg
+/// still unread or unpriced, it ends with an error rather than as wound
+/// down, so the platform starts it again to close the rest within the
+/// halt's grace.
 async fn flatten(
     host: &impl Host,
     mind: &mut Mind,
@@ -399,27 +417,45 @@ async fn flatten(
         max_order_fraction: Decimal::from(1),
         ..mind.limits
     };
+    let mut unseen = String::new();
     for _ in 0..FLATTEN_STEPS {
-        let state = match read_state(host).await {
-            Ok(state) => state,
-            Err(error) => {
-                host.note(&format!("halt's look skipped: a read failed: {error}"));
-                if !pause(host, mind, waking, config::LOOKS_AGAIN_AFTER).await {
-                    break;
+        unseen.clear();
+        match read_state(host).await {
+            Err(error) => unseen = format!("a read failed: {error}"),
+            Ok(state) => {
+                let missing = unpriced(&state, &mind.quotes);
+                if !missing.is_empty() {
+                    unseen = format!("no quote yet for {}", missing.join(", "));
                 }
-                continue;
+                let plan = Plan::Reduce {
+                    perp: unwind(&limits, &state, &mind.quotes),
+                };
+                let (spot, perp) = held(&state);
+                let closes = matches!(plan, Plan::Reduce { perp: Some(_) })
+                    || trim(&limits, &state, &mind.quotes, spot, perp).is_some();
+                if closes {
+                    if carry_out(host, mind, &limits, &state, &plan).await? {
+                        continue;
+                    }
+                    // Refused: try again after a pause, not at once.
+                } else if unseen.is_empty() {
+                    return Ok(());
+                }
             }
-        };
-        let plan = Plan::Reduce {
-            perp: unwind(&limits, &state, &mind.quotes),
-        };
-        let (spot, perp) = held(&state);
-        if perp == decide::zero() && trim(&limits, &state, &mind.quotes, spot, perp).is_none() {
-            return Ok(());
         }
-        carry_out(host, mind, &limits, &state, &plan).await?;
+        if !unseen.is_empty() {
+            host.note(&format!("halt waiting to look again: {unseen}"));
+        }
+        if !pause(host, mind, waking, config::LOOKS_AGAIN_AFTER).await {
+            break;
+        }
     }
-    Ok(())
+    if unseen.is_empty() {
+        // The market would not take the closes: the contract closes the rest
+        // through the same reduce-only path.
+        return Ok(());
+    }
+    Err(format!("the halt left a leg unclosed: {unseen}"))
 }
 
 /// Send one order, and say how much of it filled, signed as the position
@@ -503,12 +539,16 @@ mod tests {
         assert!(manifest.contains("a fall from before a restart is not remembered"));
         assert!(!manifest.contains("fall from the vault's peak"));
         assert!(manifest.contains(
-            "the stop holds until then, a read that fails never restarts it, and a restart \
-             measures a share afresh"
+            "the stop holds until then, a read that fails outside a halt never restarts it, \
+             and a restart measures a share afresh"
         ));
         assert!(manifest.contains("opens nothing until the platform restarts the agent"));
         assert!(manifest.contains("the stop is cleared when the platform restarts"));
         assert!(manifest.contains("A read that fails is a look skipped"));
+        assert!(manifest.contains("a handover to another executor"));
+        assert!(manifest.contains("it never ends the halt as done while a leg held is unpriced"));
+        assert!(manifest.contains("tank topped up after running dry"));
+        assert!(manifest.contains("read what the vault holds ends in error rather than as done"));
         assert!(manifest.contains("save a halt's closing orders"));
         assert!(!manifest.contains("lifts") && !manifest.contains("Only reduces"));
         assert!(manifest.contains("[drivers.hyperliquid]"));
@@ -528,6 +568,9 @@ mod tests {
         sent: Cell<u32>,
         /// Each action sent, and each move made (as `None`).
         log: RefCell<Vec<Option<Action>>>,
+        /// Whether a fill moves the account's legs, or leaves the account
+        /// as the test set it.
+        fills_move_the_legs: Cell<bool>,
     }
 
     impl Fake {
@@ -538,6 +581,7 @@ mod tests {
                 failing: Cell::new(0),
                 sent: Cell::new(0),
                 log: RefCell::new(Vec::new()),
+                fills_move_the_legs: Cell::new(false),
             }
         }
     }
@@ -567,6 +611,20 @@ mod tests {
             self.sent.set(self.sent.get() + 1);
             let action = from_payload::<Action>(&actions[0]).unwrap();
             self.log.borrow_mut().push(Some(action.clone()));
+            if let Action::Place(order) = &action
+                && self.fills_move_the_legs.get()
+            {
+                let moved = match order.side {
+                    Side::Buy => order.size,
+                    Side::Sell => -order.size,
+                };
+                let mut state = self.state.borrow_mut();
+                if order.market == config::PERP {
+                    state.positions[0].size += moved;
+                } else {
+                    state.spot[1].total += moved;
+                }
+            }
             let receipt = match action {
                 Action::Place(order) => Receipt::Filled {
                     order_id: 1,
@@ -712,5 +770,96 @@ mod tests {
             )),
             "added within the halt"
         );
+    }
+
+    /// Both books about $25 from the start, as they arrive every second.
+    fn both_books() -> impl Stream<Item = Woke> + Unpin {
+        let top = |mid: &str| Top {
+            bid: Some(decimal(mid) - decimal("0.01")),
+            ask: Some(decimal(mid) + decimal("0.01")),
+        };
+        futures::stream::iter(
+            std::iter::repeat_with(move || [Woke::PerpBook(top("25")), Woke::SpotBook(top("25"))])
+                .take(1_000)
+                .flatten(),
+        )
+    }
+
+    fn halting() -> impl Stream<Item = Woke> + Unpin {
+        let halting = Woke::Vault(vault::VaultEvent::Halting("halted".into()));
+        futures::stream::iter([halting]).chain(futures::stream::pending())
+    }
+
+    #[test]
+    fn a_fresh_start_inside_a_halt_closes_the_carry_short_first_once_the_books_come() {
+        // A fresh start: nothing heard of either book yet.
+        let host = Fake::new(account("1000", "25"));
+        host.fills_move_the_legs.set(true);
+        let mut mind = Mind::new();
+        futures::executor::block_on(serve(
+            &host,
+            &mut mind,
+            vault_first(halting(), both_books()),
+        ))
+        .expect("the halt ended in error");
+        let (spot, perp) = held(&host.state.borrow());
+        assert_eq!(perp, decide::zero(), "the halt ended with the short open");
+        assert!(
+            spot <= decimal(config::HYPE_KEPT_FOR_SENDS_HOME),
+            "the halt ended with the spot open"
+        );
+        let log = host.log.borrow();
+        let first_close = log.iter().flatten().next();
+        assert!(
+            matches!(first_close, Some(Action::Place(order)) if order.reduce_only),
+            "the short was not bought back first: {first_close:?}"
+        );
+    }
+
+    #[test]
+    fn a_halt_that_never_hears_a_quote_for_what_it_holds_closes_nothing_and_never_ends_as_wound_down()
+     {
+        let host = Fake::new(account("1000", "25"));
+        let mut mind = Mind::new();
+        // Funding only: neither book comes.
+        let funding = futures::stream::iter(
+            std::iter::repeat_with(|| Woke::Funding(decimal("0.001"))).take(10_000),
+        );
+        let ended =
+            futures::executor::block_on(serve(&host, &mut mind, vault_first(halting(), funding)));
+        assert!(ended.is_err(), "ended as wound down with both legs open");
+        assert_eq!(host.sent.get(), 0, "traded at a price it never heard");
+    }
+
+    #[test]
+    fn cash_brought_home_while_looks_are_skipped_is_held_for_leavers_at_the_next_look() {
+        let host = Fake::new(account("1000", "25"));
+        host.failing.set(1);
+        let mut mind = Mind::new();
+        // A read fails, and cash comes home for leavers within the pause
+        // after it, so neither look reads the vault.
+        look(&host, &mut mind, "25");
+        futures::executor::block_on(step(&host, &mut mind, true)).unwrap();
+        assert_eq!(mind.leavers.held(), decide::zero());
+        host.clock.set(host.clock.get() + config::LOOKS_AGAIN_AFTER);
+        look(&host, &mut mind, "25");
+        assert!(
+            mind.leavers.held() > decide::zero(),
+            "the cash brought home for leavers was forgotten"
+        );
+    }
+
+    #[test]
+    fn a_halt_that_cannot_read_what_is_held_never_ends_as_wound_down() {
+        let host = Fake::new(account("1000", "25"));
+        host.failing.set(u32::MAX);
+        let mut mind = Mind::new();
+        mind.quotes = quotes("25");
+        let mut waking = futures::stream::iter(
+            std::iter::repeat_with(|| Woke::Funding(decimal("0.001"))).take(10_000),
+        );
+        let ended = futures::executor::block_on(flatten(&host, &mut mind, &mut waking));
+        assert!(ended.is_err(), "ended as wound down without reading");
+        assert_eq!(host.sent.get(), 0);
     }
 }

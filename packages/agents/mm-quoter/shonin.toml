@@ -13,6 +13,16 @@ The venue does that at most ten times a day (UTC), so after eight such \
 cancels in a day the agent pulls its quotes and stops quoting until the \
 next day. Its count starts again if the agent is restarted.
 
+On a halt it first cancels every order resting on its market, whoever \
+placed it, and takes the venue's deadline off only once nothing rests \
+there; it closes its inventory only at a book it has seen, waiting for \
+one if it has none. It never ends the halt as done while an order may \
+rest or its inventory is unpriced: such a halt ends in error, and the \
+platform starts the agent again within the halt's grace, as it does after \
+a redeploy, a machine restart, a change to its allowances, its tank topped \
+up after running dry, a handover to another executor, or a fault in the \
+agent itself.
+
 Market making earns most where it is largest: the record shows the size \
 every return was earned at.
 """
