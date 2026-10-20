@@ -21,12 +21,18 @@ did to what the vault held (trading costs are not counted), so deposits and \
 withdrawals never move it. \
 It starts again from a share's value at each start of the agent, so \
 a fall from before a restart is not remembered.
+
+Once stopped it only reduces, and from then on a share is \
+measured as if the vault had kept what it held when the stop came, since what \
+it no longer holds no longer moves: the stop lifts, and it may open again, once that \
+measure is back within 5% of its peak.
 """
 claims = [
     "Gross exposure at most twice the vault's value",
     "No single order above 5% of the vault",
     "6% of the vault kept liquid, so an ordinary withdrawal closes nothing",
     "Only reduces after a 10% fall in a vault share's value from its peak since the agent last started, as it measures it from both legs' books and the funding paid: deposits and withdrawals never count",
+    "Once stopped, opens again only when a vault share, measured as if the vault had kept what it held when the stop came, is back within 5% of its peak",
     "One pair, HYPE spot against the HYPE perpetual, and nothing else",
 ]
 

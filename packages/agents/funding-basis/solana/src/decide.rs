@@ -115,32 +115,34 @@ pub fn wakes_for(settings: &Settings, event: &[u8]) -> bool {
 }
 
 /// Whether a vault share's value has fallen far enough from its peak (see
-/// [`PerShare`]) that this strategy should stop opening anything and only
-/// get smaller.
+/// [`PerShare`]), now or at an earlier look the stop hasn't lifted since,
+/// that this strategy should stop opening anything and only get smaller.
 pub fn only_reducing(share: &PerShare, limits: &Limits) -> bool {
-    share.peak > zero() && (share.peak - share.now) / share.peak >= limits.drawdown_stop
+    share.stopped()
+        || (share.peak > zero() && (share.peak - share.now) / share.peak >= limits.drawdown_stop)
 }
 
 /// What the account holds, for [`PerShare`]: each position at its mark, a
 /// perpetual's less the funding its longs have paid (`funding_index`), so a
-/// short is credited the funding it is paid. A position in a market the
-/// account doesn't quote counts no move.
+/// short is credited the funding it is paid. Every market the account
+/// quotes is there, held or not, so a market closed out still has a value
+/// to move by; a position in a market the account doesn't quote counts no
+/// move.
 pub fn held(state: &AccountState) -> Vec<Held> {
     state
-        .positions
+        .markets
         .iter()
-        .filter_map(|position| {
-            let market = state.market(&position.market)?;
+        .map(|market| {
             let paid = if market.is_perp {
                 market.funding_index
             } else {
                 zero()
             };
-            Some(Held {
-                what: position.market.clone(),
-                quantity: position.size,
+            Held {
+                what: market.market.clone(),
+                quantity: state.position(&market.market),
                 unit_value: market.mark - paid,
-            })
+            }
         })
         .collect()
 }
@@ -680,7 +682,7 @@ mod tests {
         decide(
             &Settings::shipped(),
             &limits(),
-            &PerShare::default(),
+            &PerShare::new(config::DRAWDOWN_STOP, config::STOP_LIFTS_WITHIN),
             zero(),
             state,
         )
@@ -1044,7 +1046,7 @@ mod tests {
 
     /// `state`'s value of a share, after `share` has looked at it.
     fn looked(share: &mut PerShare, state: &AccountState) -> PerShare {
-        share.look(state.vault_value, held(state));
+        share.look(state.vault_value, Some(state.vault_value), held(state));
         share.clone()
     }
 
@@ -1053,7 +1055,7 @@ mod tests {
         // A $100,000 vault carrying 0.8 against 0.8 short, $15,000 of it at
         // the venue in cash and $85,000 in the vault.
         let before = holding(state("85000", "15000", ABOVE_ENTRY), "0.8", "0.8");
-        let mut share = PerShare::default();
+        let mut share = PerShare::new(config::DRAWDOWN_STOP, config::STOP_LIFTS_WITHIN);
         looked(&mut share, &before);
         // A holder of 15% of the shares leaves, and their fraction of both
         // legs and of the cash goes with them. No price moved.
@@ -1069,9 +1071,38 @@ mod tests {
     }
 
     #[test]
+    fn once_closed_out_after_the_stop_it_opens_again_when_the_pair_has_recovered() {
+        let before = holding(state("85000", "15000", ABOVE_ENTRY), "0.8", "0.8");
+        let mut share = PerShare::new(config::DRAWDOWN_STOP, config::STOP_LIFTS_WITHIN);
+        looked(&mut share, &before);
+        // The spot falls $14,000 under the perpetual: stopped.
+        let mut after = before.clone();
+        for market in &mut after.markets {
+            if !market.is_perp {
+                market.mark -= d("14000");
+            }
+        }
+        after.vault_value -= d("11200");
+        assert!(only_reducing(&looked(&mut share, &after), &limits()));
+        // Closed out: no position left, but each market still has a value.
+        let mut out = holding(state("88800", "0", ABOVE_ENTRY), "0", "0");
+        out.markets = after.markets.clone();
+        assert_eq!(held(&out).len(), 2);
+        assert!(only_reducing(&looked(&mut share, &out), &limits()));
+        // The spot back where it was: the pair as held is whole again.
+        out.markets = before.markets.clone();
+        let back = looked(&mut share, &out);
+        assert!(!only_reducing(&back, &limits()), "{:?}", back.now);
+        assert!(matches!(
+            decide(&Settings::shipped(), &limits(), &back, zero(), &out),
+            Plan::Build { .. }
+        ));
+    }
+
+    #[test]
     fn a_fall_in_a_share_s_value_past_the_stop_only_reduces() {
         let before = holding(state("85000", "15000", ABOVE_ENTRY), "0.8", "0.8");
-        let mut share = PerShare::default();
+        let mut share = PerShare::new(config::DRAWDOWN_STOP, config::STOP_LIFTS_WITHIN);
         looked(&mut share, &before);
         // The spot falls $14,000 under a perpetual that doesn't: $11,200 of
         // a $100,000 vault lost.
@@ -1096,7 +1127,7 @@ mod tests {
                 market.funding_index += d("2000");
             }
         }
-        let mut share = PerShare::default();
+        let mut share = PerShare::new(config::DRAWDOWN_STOP, config::STOP_LIFTS_WITHIN);
         looked(&mut share, &before);
         let share = looked(&mut share, &paid);
         assert!(!only_reducing(&share, &limits()), "{:?}", share.now);
@@ -1118,7 +1149,7 @@ mod tests {
             decide(
                 &Settings::shipped(),
                 &limits(),
-                &PerShare::default(),
+                &PerShare::new(config::DRAWDOWN_STOP, config::STOP_LIFTS_WITHIN),
                 leavers.held(),
                 state,
             )

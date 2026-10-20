@@ -64,7 +64,7 @@ fn now() -> u64 {
 impl sdk::Agent for WeekendCarry {
     async fn run() -> Result<(), String> {
         let mut mind = Mind {
-            per_share: PerShare::default(),
+            per_share: PerShare::new(config::DRAWDOWN_STOP, config::STOP_LIFTS_WITHIN),
             books: HashMap::new(),
             last_step: 0,
         };
@@ -136,14 +136,50 @@ fn venue(driver: &str) -> Account {
     })
 }
 
-/// Everything the vault is worth, everywhere, in dollars.
-async fn vault_value() -> Decimal {
-    let total: u64 = transfers::balances()
-        .await
-        .iter()
-        .map(|balance| balance.amount)
-        .sum();
-    Decimal::from(total) / Decimal::from(1_000_000u32)
+/// Whether two of the vault's accounts are the same one.
+fn same(one: &Account, other: &Account) -> bool {
+    match (one, other) {
+        (Account::Vault, Account::Vault) => true,
+        (Account::Station(one), Account::Station(other)) => one == other,
+        (Account::Venue(one), Account::Venue(other)) => {
+            one.chain == other.chain && one.driver == other.driver
+        }
+        _ => false,
+    }
+}
+
+/// Everything the vault is worth, everywhere, in dollars; and what its
+/// holdings say it is worth, the Safe's tokens at their Chainlink prices:
+/// none when one of its accounts couldn't be read, since the balances leave
+/// such an account out rather than read it as empty, or when Lighter holds
+/// something and its positions (`perps_read`) couldn't be read.
+async fn vault_value(holdings: &rh::AccountState, perps_read: bool) -> (Decimal, Option<Decimal>) {
+    let balances = transfers::balances().await;
+    let dollars = |amount: u64| Decimal::from(amount) / Decimal::from(1_000_000u32);
+    let total = dollars(balances.iter().map(|balance| balance.amount).sum());
+    let read = |account: &Account| {
+        balances
+            .iter()
+            .find(|balance| same(&balance.account, account))
+            .map(|balance| dollars(balance.amount))
+    };
+    let accounted = match (
+        read(&Account::Vault),
+        read(&Account::Station(transfers::home_chain())),
+        read(&venue(rh::DRIVER)),
+        read(&venue(lt::DRIVER)),
+    ) {
+        (Some(cash), Some(idle), Some(_), Some(perps)) if perps_read || perps <= zero() => Some(
+            holdings
+                .holdings
+                .iter()
+                .fold(cash + idle + perps + holdings.dollars, |sum, held| {
+                    sum + held.tokens * held.feed_price
+                }),
+        ),
+        _ => None,
+    };
+    (total, accounted)
 }
 
 async fn state<Q: serde::Serialize, A: serde::de::DeserializeOwned>(
@@ -153,13 +189,15 @@ async fn state<Q: serde::Serialize, A: serde::de::DeserializeOwned>(
     from_payload(&drivers::account_state(driver.to_string(), to_payload(query)).await?)
 }
 
-/// What the agent sees now.
-async fn picture(mind: &mut Mind) -> Result<Picture, String> {
+/// What the agent sees now, and whether the share's measure could take it
+/// in: a look one of whose reads failed or came back partial is not decided
+/// from.
+async fn picture(mind: &mut Mind) -> Result<(Picture, bool), String> {
     let prices: Vec<rh::TokenPrice> = state(rh::DRIVER, &rh::Query::Prices).await?;
     let holdings: rh::AccountState = state(rh::DRIVER, &rh::Query::Holdings).await?;
     // No Lighter account before the first move to it: nothing is held there.
     let perps: Option<lt::AccountState> = state(lt::DRIVER, &lt::Query::Account).await.ok();
-    let value = vault_value().await;
+    let (value, accounted) = vault_value(&holdings, perps.is_some()).await;
     let mut names = Vec::new();
     for (token, perp, market) in config::NAMES {
         let Some(price) = prices.iter().find(|p| p.token == *token) else {
@@ -192,19 +230,27 @@ async fn picture(mind: &mut Mind) -> Result<Picture, String> {
             perp_position,
         });
     }
-    mind.per_share.look(value, plan::held(&names));
-    Ok(Picture {
-        now: now(),
-        vault_value: value,
-        share: mind.per_share.now,
-        peak: mind.per_share.peak,
-        names,
-    })
+    let looked = mind.per_share.look(value, accounted, plan::held(&names));
+    Ok((
+        Picture {
+            now: now(),
+            vault_value: value,
+            share: mind.per_share.now,
+            peak: mind.per_share.peak,
+            stop_holds: mind.per_share.stopped(),
+            names,
+        },
+        looked,
+    ))
 }
 
-/// Look, decide, and take one step.
+/// Look, decide, and take one step; none from a look the share's measure
+/// skipped, since what it would be decided from was read short.
 async fn step(mind: &mut Mind) -> Result<(), String> {
-    let picture = picture(mind).await?;
+    let (picture, looked) = picture(mind).await?;
+    if !looked {
+        return Ok(());
+    }
     act(&picture, picture.next()).await
 }
 
@@ -338,7 +384,8 @@ async fn submit<A: serde::Serialize>(driver: &str, action: &A) -> Result<bool, S
 /// time.
 async fn flatten(mind: &mut Mind) -> Result<(), String> {
     for _ in 0..FLATTEN_STEPS {
-        let mut picture = picture(mind).await?;
+        // A halt closes whatever the measure makes of the look.
+        let (mut picture, _) = picture(mind).await?;
         // A halt closes regardless of the weekend or the premium: as if the
         // peak were far above.
         picture.peak = picture.share * Decimal::from(10u8);

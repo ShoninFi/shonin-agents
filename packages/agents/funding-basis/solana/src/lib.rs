@@ -73,7 +73,7 @@ impl Mind {
         Self {
             settings: Settings::shipped(),
             limits: limits(),
-            per_share: PerShare::default(),
+            per_share: PerShare::new(config::DRAWDOWN_STOP, config::STOP_LIFTS_WITHIN),
             patience: Patience::default(),
             leavers: Leavers::default(),
         }
@@ -148,7 +148,13 @@ fn venue() -> Account {
 /// for leavers.
 async fn step(mind: &mut Mind, brought_home: bool) -> Result<(), String> {
     let state = read_state().await?;
-    mind.per_share.look(state.vault_value, decide::held(&state));
+    // The driver reads the account and the vault whole or not at all, so
+    // its value is what its holdings account for.
+    mind.per_share.look(
+        state.vault_value,
+        Some(state.vault_value),
+        decide::held(&state),
+    );
     if brought_home {
         mind.leavers.brought_home(&mind.limits, &state);
     } else {
@@ -358,6 +364,11 @@ mod tests {
         );
         assert!(manifest.contains("a fall from before a restart is not remembered"));
         assert!(!manifest.contains("fall from the vault's peak"));
+        assert!(
+            manifest.contains(
+                "as if the vault had kept what it held when the stop came, is back within 5% of its peak"
+            ) && config::STOP_LIFTS_WITHIN == "0.05"
+        );
         assert!(manifest.contains(config::SPOT) && manifest.contains(config::PERP));
     }
 }

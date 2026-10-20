@@ -66,7 +66,7 @@ impl sdk::Agent for Spot {
             .ok_or_else(|| format!("this agent trades on no venue on {home}"))?;
         let mut mind = Mind {
             venue,
-            per_share: PerShare::default(),
+            per_share: PerShare::new(config::DRAWDOWN_STOP, config::STOP_LIFTS_WITHIN),
             last_step: 0,
         };
         let ticks = clock(venue)?;
@@ -127,6 +127,18 @@ fn clock(venue: &config::Venue) -> Result<futures::stream::LocalBoxStream<'stati
     Ok(futures::stream::select_all(ticks).boxed_local())
 }
 
+/// Whether two of the vault's accounts are the same one.
+fn same(one: &Account, other: &Account) -> bool {
+    match (one, other) {
+        (Account::Vault, Account::Vault) => true,
+        (Account::Station(one), Account::Station(other)) => one == other,
+        (Account::Venue(one), Account::Venue(other)) => {
+            one.chain == other.chain && one.driver == other.driver
+        }
+        _ => false,
+    }
+}
+
 /// The vault's account at its driver: the station's Safe.
 fn safe(venue: &config::Venue) -> Account {
     Account::Venue(VenueAccount {
@@ -142,20 +154,36 @@ async fn state<Q: serde::Serialize, A: serde::de::DeserializeOwned>(
     from_payload(&drivers::account_state(venue.driver.to_string(), to_payload(query)).await?)
 }
 
-/// What the agent sees now.
-async fn picture(mind: &mut Mind) -> Result<Picture, String> {
+/// What the agent sees now, and whether the share's measure could take it
+/// in: a look one of whose reads failed or came back partial is not decided
+/// from.
+async fn picture(mind: &mut Mind) -> Result<(Picture, bool), String> {
     let prices: Vec<venues::TokenPrice> = state(mind.venue, &venues::Query::Prices).await?;
     let held: venues::AccountState = state(mind.venue, &venues::Query::Holdings).await?;
     let balances = transfers::balances().await;
     let dollars = |amount: u64| Decimal::from(amount) / Decimal::from(1_000_000u32);
     // Every account the vault has, the Safe valued by its driver.
     let value = dollars(balances.iter().map(|balance| balance.amount).sum());
-    let cash = dollars(
+    let read = |account: &Account| {
         balances
             .iter()
-            .find(|balance| matches!(balance.account, Account::Vault))
-            .map_or(0, |balance| balance.amount),
+            .find(|balance| same(&balance.account, account))
+            .map(|balance| dollars(balance.amount))
+    };
+    let home = transfers::home_chain();
+    // An account whose read failed is left out of the balances, not read
+    // as empty: each of the vault's must be there.
+    let (cash, idle, in_safe) = (
+        read(&Account::Vault),
+        read(&Account::Station(home)),
+        read(&safe(mind.venue)),
     );
+    // What the Safe's holdings and the vault's dollars say it is worth.
+    let accounted = match (cash, idle, in_safe) {
+        (Some(cash), Some(idle), Some(_)) => Some((cash, idle)),
+        _ => None,
+    };
+    let cash = cash.unwrap_or_else(zero);
     let mut names = Vec::new();
     for (token, weight) in mind.venue.weights {
         // A token the driver doesn't list is not traded.
@@ -176,22 +204,31 @@ async fn picture(mind: &mut Mind) -> Result<Picture, String> {
             paused: price.paused,
         });
     }
-    mind.per_share.look(value, plan::held(&names));
-    Ok(Picture {
-        value,
-        cash,
-        safe_dollars: held.dollars,
-        share: mind.per_share.now,
-        peak: mind.per_share.peak,
-        names,
-    })
+    let accounted =
+        accounted.map(|(cash, idle)| plan::accounted(&names, cash + idle + held.dollars));
+    let looked = mind.per_share.look(value, accounted, plan::held(&names));
+    Ok((
+        Picture {
+            value,
+            cash,
+            safe_dollars: held.dollars,
+            share: mind.per_share.now,
+            peak: mind.per_share.peak,
+            stop_holds: mind.per_share.stopped(),
+            names,
+        },
+        looked,
+    ))
 }
 
-/// Look, decide, and take one step.
+/// Look, decide, and take one step; none from a look the share's measure
+/// skipped, since what it would be decided from was read short.
 async fn step(mind: &mut Mind) -> Result<(), String> {
     mind.last_step = now();
-    let picture = picture(mind).await?;
-    act(mind.venue, &picture, picture.next(false)).await?;
+    let (picture, looked) = picture(mind).await?;
+    if looked {
+        act(mind.venue, &picture, picture.next(false)).await?;
+    }
     Ok(())
 }
 
@@ -252,7 +289,8 @@ async fn submit(venue: &config::Venue, action: &venues::Action) -> Result<bool, 
 /// home: a halt is an unwind with less time.
 async fn flatten(mind: &mut Mind) -> Result<(), String> {
     for _ in 0..FLATTEN_STEPS {
-        let picture = picture(mind).await?;
+        // A halt sells whatever the measure makes of the look.
+        let (picture, _) = picture(mind).await?;
         let step = picture.next(true);
         if step == Step::Nothing || !act(mind.venue, &picture, step).await? {
             break;
