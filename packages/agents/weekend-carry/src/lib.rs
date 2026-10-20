@@ -15,6 +15,7 @@
 //! and the manifest claims them in the same words.
 
 mod config;
+mod per_share;
 mod plan;
 mod venues;
 
@@ -27,6 +28,7 @@ use sdk::{Decimal, Verdict, decimal, drivers, from_payload, millionths, to_paylo
 use strategy_sdk as sdk;
 use venues::{lighter as lt, robinhood as rh};
 
+use per_share::PerShare;
 use plan::{Name, Picture, Step, zero};
 
 /// How many steps a halt may take to close everything before leaving the
@@ -38,7 +40,9 @@ struct WeekendCarry;
 /// What the agent remembers between steps: rebuilt from the venues whenever
 /// it starts, so a restart costs a moment and nothing else.
 struct Mind {
-    peak: Decimal,
+    /// The value of a vault share since the agent started, and its peak:
+    /// what the drawdown stop is measured on.
+    per_share: PerShare,
     /// Each perpetual's best bid and ask, by Lighter market number.
     books: HashMap<u32, (Decimal, Decimal)>,
     last_step: u64,
@@ -60,7 +64,7 @@ fn now() -> u64 {
 impl sdk::Agent for WeekendCarry {
     async fn run() -> Result<(), String> {
         let mut mind = Mind {
-            peak: zero(),
+            per_share: PerShare::default(),
             books: HashMap::new(),
             last_step: 0,
         };
@@ -156,9 +160,6 @@ async fn picture(mind: &mut Mind) -> Result<Picture, String> {
     // No Lighter account before the first move to it: nothing is held there.
     let perps: Option<lt::AccountState> = state(lt::DRIVER, &lt::Query::Account).await.ok();
     let value = vault_value().await;
-    if value > mind.peak {
-        mind.peak = value;
-    }
     let mut names = Vec::new();
     for (token, perp, market) in config::NAMES {
         let Some(price) = prices.iter().find(|p| p.token == *token) else {
@@ -182,6 +183,7 @@ async fn picture(mind: &mut Mind) -> Result<Picture, String> {
             token: token.to_string(),
             perp: perp.to_string(),
             token_price: price.market_price,
+            feed_price: price.feed_price,
             multiplier: price.multiplier,
             paused: price.paused,
             perp_bid: *bid,
@@ -190,10 +192,12 @@ async fn picture(mind: &mut Mind) -> Result<Picture, String> {
             perp_position,
         });
     }
+    mind.per_share.look(value, plan::held(&names));
     Ok(Picture {
         now: now(),
         vault_value: value,
-        peak: mind.peak,
+        share: mind.per_share.now,
+        peak: mind.per_share.peak,
         names,
     })
 }
@@ -337,7 +341,7 @@ async fn flatten(mind: &mut Mind) -> Result<(), String> {
         let mut picture = picture(mind).await?;
         // A halt closes regardless of the weekend or the premium: as if the
         // peak were far above.
-        picture.peak = picture.vault_value * Decimal::from(10u8);
+        picture.peak = picture.share * Decimal::from(10u8);
         match picture.next() {
             Step::Nothing => return Ok(()),
             close @ Step::Close { .. } => act(&picture, close).await?,

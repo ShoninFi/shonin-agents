@@ -4,6 +4,7 @@
 use strategy_sdk::{Decimal, decimal};
 
 use crate::config;
+use crate::per_share::Held;
 
 pub fn zero() -> Decimal {
     Decimal::from(0)
@@ -37,6 +38,8 @@ pub struct Name {
     pub perp: String,
     /// The token's market price (its pool's), in dollars per token.
     pub token_price: Decimal,
+    /// Chainlink's price for the token, which the vault is valued at.
+    pub feed_price: Decimal,
     /// Shares of the stock per token.
     pub multiplier: Decimal,
     /// The issuer has paused the token's oracle: nothing is opened.
@@ -75,6 +78,10 @@ pub struct Picture {
     pub now: u64,
     /// Everything the vault is worth, everywhere.
     pub vault_value: Decimal,
+    /// The value of a vault share now, and the highest it has been since
+    /// the agent started, each as a multiple of its value then (see
+    /// [`PerShare`](crate::per_share::PerShare)).
+    pub share: Decimal,
     pub peak: Decimal,
     pub names: Vec<Name>,
 }
@@ -100,10 +107,35 @@ pub enum Step {
     Nothing,
 }
 
+/// What the vault holds of `names`, for
+/// [`PerShare`](crate::per_share::PerShare): each token at its Chainlink
+/// price, and each perpetual at the middle of its book. One without a price
+/// counts no move.
+pub fn held(names: &[Name]) -> Vec<Held> {
+    let mut held = Vec::new();
+    for name in names {
+        if name.feed_price > zero() {
+            held.push(Held {
+                what: name.token.clone(),
+                quantity: name.tokens,
+                unit_value: name.feed_price,
+            });
+        }
+        if name.perp_bid > zero() && name.perp_ask > zero() {
+            held.push(Held {
+                what: format!("perp:{}", name.perp),
+                quantity: name.perp_position,
+                unit_value: (name.perp_bid + name.perp_ask) / Decimal::from(2u8),
+            });
+        }
+    }
+    held
+}
+
 impl Picture {
+    /// Whether a vault share's value has fallen by the stop from its peak.
     pub fn only_reducing(&self) -> bool {
-        self.peak > zero()
-            && (self.peak - self.vault_value) / self.peak >= decimal(config::DRAWDOWN_STOP)
+        self.peak > zero() && (self.peak - self.share) / self.peak >= decimal(config::DRAWDOWN_STOP)
     }
 
     fn gross(&self) -> Decimal {
@@ -200,6 +232,7 @@ mod tests {
             token: "SPY".into(),
             perp: "SPY".into(),
             token_price: decimal("700"),
+            feed_price: decimal("700"),
             multiplier: decimal("1"),
             paused: false,
             perp_bid: decimal(perp_bid),
@@ -213,7 +246,8 @@ mod tests {
         Picture {
             now,
             vault_value: decimal("100000"),
-            peak: decimal("100000"),
+            share: decimal("1"),
+            peak: decimal("1"),
             names,
         }
     }
@@ -282,9 +316,70 @@ mod tests {
         held.tokens = decimal("5");
         held.perp_position = decimal("-5");
         let mut p = picture(SATURDAY, vec![held]);
-        p.vault_value = decimal("89000");
+        p.share = decimal("0.89");
         assert!(p.only_reducing());
         assert!(matches!(p.next(), Step::Close { .. }));
+    }
+
+    #[test]
+    fn the_manifest_claims_the_stop_as_a_fall_in_a_share_s_value() {
+        let manifest = include_str!("../shonin.toml");
+        assert!(
+            manifest.contains("a 10% fall in a vault share's value")
+                && config::DRAWDOWN_STOP == "0.10"
+        );
+        assert!(manifest.contains("a fall from before a restart is not remembered"));
+        assert!(!manifest.contains("fall from the vault's peak"));
+    }
+
+    #[test]
+    fn a_leaver_taking_a_tenth_of_the_vault_does_not_stop_the_agent() {
+        use crate::per_share::PerShare;
+        let mut per_share = PerShare::default();
+        let mut looked = |mut p: Picture| {
+            per_share.look(p.vault_value, held(&p.names));
+            p.share = per_share.now;
+            p.peak = per_share.peak;
+            p
+        };
+        // A $100,000 vault carrying 100 SPY tokens against 100 shorted.
+        let mut carry = spy("710");
+        carry.tokens = decimal("100");
+        carry.perp_position = decimal("-100");
+        let before = looked(picture(SATURDAY, vec![carry.clone()]));
+        assert_eq!(before.next(), Step::Nothing, "{:?}", before.next());
+        // A holder of 15% of the shares leaves, and their fraction of both
+        // legs is closed: $85,000 carrying 85 against 85. No price moved.
+        carry.tokens = decimal("85");
+        carry.perp_position = decimal("-85");
+        let mut after = picture(SATURDAY, vec![carry]);
+        after.vault_value = decimal("85000");
+        let after = looked(after);
+        assert_eq!(after.share, decimal("1"));
+        assert!(!after.only_reducing());
+        assert_eq!(after.next(), Step::Nothing, "{:?}", after.next());
+    }
+
+    #[test]
+    fn a_fall_in_a_share_s_value_past_the_stop_only_reduces() {
+        use crate::per_share::PerShare;
+        let mut per_share = PerShare::default();
+        let mut carry = spy("710");
+        carry.tokens = decimal("100");
+        carry.perp_position = decimal("-100");
+        let before = picture(SATURDAY, vec![carry.clone()]);
+        per_share.look(before.vault_value, held(&before.names));
+        // The gap widens: the perpetual $110 a share higher, the token
+        // where it was, on 100 shorted in a $100,000 vault: 11% lost.
+        carry.perp_bid = decimal("820");
+        carry.perp_ask = decimal("820.05");
+        let mut after = picture(SATURDAY, vec![carry]);
+        after.vault_value = decimal("89000");
+        per_share.look(after.vault_value, held(&after.names));
+        after.share = per_share.now;
+        after.peak = per_share.peak;
+        assert!(after.only_reducing(), "{:?}", after.share);
+        assert!(matches!(after.next(), Step::Close { .. }));
     }
 
     #[test]

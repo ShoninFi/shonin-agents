@@ -14,12 +14,14 @@
 
 mod config;
 mod decide;
+mod per_share;
 
 use decide::{
     Leavers, Patience, Plan, Quotes, Snapshot, Top, hedge, held, limits, spot_dollars, trim, unwind,
 };
 use futures::StreamExt;
 use hl::{AccountState, Action, Balance, Order, Receipt, Side};
+use per_share::PerShare;
 use sdk::streams::{self, HYPERLIQUID, HyperliquidFeed, HyperliquidValue};
 use sdk::transfers::{self, Account, Moved, VenueAccount};
 use sdk::{Decimal, Limits, drivers, from_payload, millionths, to_payload, vault};
@@ -45,8 +47,12 @@ struct FundingBasis;
 struct Mind {
     limits: Limits,
     quotes: Quotes,
-    /// The most the vault has been worth while this instance watched it.
-    peak: Decimal,
+    /// The value of a vault share while this instance watched it, and its
+    /// peak: what the drawdown stop is measured on.
+    per_share: PerShare,
+    /// The funding the account has been paid since this instance began
+    /// (negative when it paid), as the venue's events said.
+    funding_paid: Decimal,
     /// Whether the perp's leverage has been set since this instance began.
     levered: bool,
     /// Whether the last look found something to do, so the next funding
@@ -65,7 +71,8 @@ impl Mind {
         Self {
             limits: limits(),
             quotes: Quotes::default(),
-            peak: decide::zero(),
+            per_share: PerShare::default(),
+            funding_paid: decide::zero(),
             levered: false,
             busy: false,
             patience: Patience::default(),
@@ -155,6 +162,7 @@ impl sdk::Agent for FundingBasis {
                     }
                 }
                 Woke::Venue(event) => {
+                    mind.funding_paid += decide::funding_paid(&event);
                     if decide::wakes_for(&event) {
                         step(&mut mind, false).await?
                     }
@@ -189,9 +197,8 @@ fn venue() -> Account {
 /// leavers.
 async fn step(mind: &mut Mind, brought_home: bool) -> Result<(), String> {
     let state = read_state().await?;
-    if state.vault_value > mind.peak {
-        mind.peak = state.vault_value;
-    }
+    let holdings = decide::share_holdings(&state, &mind.quotes, mind.funding_paid);
+    mind.per_share.look(state.vault_value, holdings);
     if brought_home {
         mind.leavers.brought_home(&mind.limits, &state);
     } else {
@@ -199,7 +206,7 @@ async fn step(mind: &mut Mind, brought_home: bool) -> Result<(), String> {
     }
     let plan = decide::decide(
         &mind.limits,
-        mind.peak,
+        &mind.per_share,
         mind.leavers.held(),
         &state,
         &mind.quotes,
@@ -399,7 +406,12 @@ mod tests {
         );
         assert!(manifest.contains("above 5% of the vault") && config::MAX_ORDER_FRACTION == "0.05");
         assert!(manifest.contains("6% of the vault kept liquid") && config::IDLE_BUFFER == "0.06");
-        assert!(manifest.contains("a 10% fall") && config::DRAWDOWN_STOP == "0.10");
+        assert!(
+            manifest.contains("a 10% fall in a vault share's value")
+                && config::DRAWDOWN_STOP == "0.10"
+        );
+        assert!(manifest.contains("a fall from before a restart is not remembered"));
+        assert!(!manifest.contains("fall from the vault's peak"));
         assert!(manifest.contains("[drivers.hyperliquid]"));
     }
 }

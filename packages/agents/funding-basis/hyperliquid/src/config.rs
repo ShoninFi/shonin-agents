@@ -47,5 +47,6 @@ pub const MAX_ORDER_FRACTION: &str = "0.05";
 /// 6% of the vault kept liquid, so an ordinary withdrawal closes nothing:
 /// a little above the vault's own 5% idle floor, which it never moves past.
 pub const IDLE_BUFFER: &str = "0.06";
-/// Only reduces after a 10% fall from the vault's peak.
+/// Only reduces after a 10% fall in a vault share's value from its peak since
+/// the agent last started, as it measures it (`per_share.rs`).
 pub const DRAWDOWN_STOP: &str = "0.10";

@@ -7,17 +7,25 @@ text = """
 Holds the spot asset and shorts the perpetual against it, so the position has \
 no view on the price, and collects the funding the shorts are paid while the \
 perpetual trades above the spot. When funding falls far enough it unwinds, \
-and when the vault falls far enough from its peak it only reduces.
+and when a vault share's value falls far enough from its peak it only reduces.
 
 The edge is mechanical and it compresses as more capital chases it, which is \
 the honest thing to say about it: the record shows the size it was earned at, \
 and a larger vault should expect less.
+
+The agent can't read the vault's share price, so it measures a share's \
+value itself: from one look to the next, a share gains or loses what the \
+moves of both legs' marks, and the funding the short was paid or owed, did \
+to what the vault held (trading costs are not counted), so deposits and \
+withdrawals never move it. \
+It starts again from a share's value at each start of the agent, so \
+a fall from before a restart is not remembered.
 """
 claims = [
     "Gross exposure at most twice the vault's value",
     "No single order above 5% of the vault",
     "6% of the vault kept liquid, so an ordinary withdrawal closes nothing",
-    "Only reduces after a 10% fall from the vault's peak",
+    "Only reduces after a 10% fall in a vault share's value from its peak since the agent last started, as it measures it from the marks and funding of both legs: deposits and withdrawals never count",
     "One market, BTC against BTC-PERP, and nothing else",
 ]
 

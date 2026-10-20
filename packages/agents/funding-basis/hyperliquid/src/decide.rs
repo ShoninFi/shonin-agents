@@ -17,6 +17,7 @@ use strategy_sdk::hyperliquid as hl;
 use strategy_sdk::{Decimal, Limits, decimal, from_payload, size_for};
 
 use crate::config;
+use crate::per_share::{Held, PerShare};
 
 /// The limits in `config.rs`, as numbers.
 pub fn limits() -> Limits {
@@ -209,10 +210,49 @@ pub fn wakes_for(event: &[u8]) -> bool {
     )
 }
 
-/// Whether the vault has fallen far enough from its peak that this strategy
-/// should stop opening anything and only get smaller.
-pub fn only_reducing(peak: Decimal, value: Decimal, limits: &Limits) -> bool {
-    peak > zero() && (peak - value) / peak >= limits.drawdown_stop
+/// Whether a vault share's value has fallen far enough from its peak (see
+/// [`PerShare`]) that this strategy should stop opening anything and only
+/// get smaller.
+pub fn only_reducing(share: &PerShare, limits: &Limits) -> bool {
+    share.peak > zero() && (share.peak - share.now) / share.peak >= limits.drawdown_stop
+}
+
+/// What the account holds, for [`PerShare`]: the spot and the perpetual each
+/// at the middle of its book, and the funding the account has been paid
+/// since the agent started (`funding`, negative when it paid), whose growth
+/// is what it earned. A leg whose book isn't known counts no move.
+pub fn share_holdings(state: &AccountState, quotes: &Quotes, funding: Decimal) -> Vec<Held> {
+    let mid = |top: Top| match (top.bid, top.ask) {
+        (Some(bid), Some(ask)) if bid > zero() && ask > zero() => {
+            Some((bid + ask) / Decimal::from(2))
+        }
+        _ => None,
+    };
+    let (spot, perp) = held(state);
+    let mut holdings = vec![Held {
+        what: "funding".to_string(),
+        quantity: Decimal::from(1),
+        unit_value: funding,
+    }];
+    for (what, quantity, top) in [("spot", spot, quotes.spot), ("perp", perp, quotes.perp)] {
+        if let Some(price) = mid(top) {
+            holdings.push(Held {
+                what: what.to_string(),
+                quantity,
+                unit_value: price,
+            });
+        }
+    }
+    holdings
+}
+
+/// The funding the account was paid (negative when it paid), as an event
+/// from the venue says.
+pub fn funding_paid(event: &[u8]) -> Decimal {
+    match from_payload::<AccountEvent>(event) {
+        Ok(AccountEvent::Funding { amount, .. }) => amount,
+        _ => zero(),
+    }
 }
 
 /// What both legs are worth at the prices they would close at.
@@ -233,7 +273,7 @@ fn legs_gross(quotes: &Quotes, spot: Decimal, perp: Decimal) -> Decimal {
 /// [`Leavers`]).
 pub fn decide(
     limits: &Limits,
-    peak: Decimal,
+    share: &PerShare,
     for_leavers: Decimal,
     state: &AccountState,
     quotes: &Quotes,
@@ -243,7 +283,7 @@ pub fn decide(
     };
     let (spot, perp) = held(state);
     let holding = spot > zero() || perp < zero();
-    let reducing = only_reducing(peak, state.vault_value, limits);
+    let reducing = only_reducing(share, limits);
 
     if holding && (reducing || regime(funding) == Regime::Exit) {
         let perp_order = unwind(limits, state, quotes);
@@ -796,7 +836,7 @@ mod tests {
     }
 
     fn plan(state: &AccountState, quotes: &Quotes) -> Plan {
-        decide(&limits(), state.vault_value, zero(), state, quotes)
+        decide(&limits(), &PerShare::default(), zero(), state, quotes)
     }
 
     fn settle(state: &mut AccountState) -> (usize, usize) {
@@ -1037,6 +1077,64 @@ mod tests {
         assert_eq!(state.station_idle, zero());
     }
 
+    #[test]
+    fn a_leaver_taking_a_tenth_of_the_vault_does_not_stop_the_agent() {
+        // A $30,000 vault carrying 400 HYPE against 400 short.
+        let mut before = state("15000", "5000");
+        balance(&mut before, config::SPOT_TOKEN).total = d("400");
+        *perp_size(&mut before) = d("-400");
+        revalue(&mut before);
+        let quotes = quotes(ABOVE_ENTRY);
+        let mut share = PerShare::default();
+        share.look(before.vault_value, share_holdings(&before, &quotes, zero()));
+        // A holder of 15% of the shares leaves, and their fraction of both
+        // legs and of the cash goes with them. No price moved.
+        let mut after = state("12750", "4250");
+        balance(&mut after, config::SPOT_TOKEN).total = d("340");
+        *perp_size(&mut after) = d("-340");
+        revalue(&mut after);
+        share.look(after.vault_value, share_holdings(&after, &quotes, zero()));
+        assert_eq!(share.now, d("1"));
+        assert!(!only_reducing(&share, &limits()));
+        assert_eq!(
+            decide(&limits(), &share, zero(), &after, &quotes),
+            plan(&after, &quotes)
+        );
+    }
+
+    #[test]
+    fn a_fall_in_a_share_s_value_past_the_stop_only_reduces() {
+        let mut held_now = state("15000", "5000");
+        balance(&mut held_now, config::SPOT_TOKEN).total = d("400");
+        *perp_size(&mut held_now) = d("-400");
+        revalue(&mut held_now);
+        let mut share = PerShare::default();
+        share.look(
+            held_now.vault_value,
+            share_holdings(&held_now, &quotes(ABOVE_ENTRY), zero()),
+        );
+        // The perpetual $8 higher and the spot where it was: $3,200 lost
+        // on the short, more than a tenth of the $30,000 vault.
+        let mut apart = quotes(ABOVE_ENTRY);
+        apart.perp = Top {
+            bid: Some(d("32.99")),
+            ask: Some(d("33.01")),
+        };
+        let mut after = held_now.clone();
+        after.vault_value -= d("3200");
+        let mut fallen = share.clone();
+        fallen.look(after.vault_value, share_holdings(&after, &apart, zero()));
+        assert!(only_reducing(&fallen, &limits()), "{:?}", fallen.now);
+        assert!(matches!(
+            decide(&limits(), &fallen, zero(), &after, &apart),
+            Plan::Reduce { .. }
+        ));
+        // Funding the short was paid meanwhile counts for it.
+        let mut paid = share.clone();
+        paid.look(after.vault_value, share_holdings(&after, &apart, d("400")));
+        assert!(!only_reducing(&paid, &limits()), "{:?}", paid.now);
+    }
+
     /// `buffer-low` brings cash home from the account for leavers waiting on
     /// a valuation. Until the valuation pays them, that cash stays in the
     /// vault however far the carry is from its target.
@@ -1050,7 +1148,7 @@ mod tests {
         let decided = |state: &AccountState, leavers: &Leavers| {
             decide(
                 &limits(),
-                state.vault_value,
+                &PerShare::default(),
                 leavers.held(),
                 state,
                 &quotes(ABOVE_ENTRY),
