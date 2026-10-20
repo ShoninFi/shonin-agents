@@ -19,9 +19,11 @@
 
 mod config;
 mod decide;
+mod per_share;
 
 use decide::{Leavers, Patience, Plan, Settings, Snapshot, hedge, limits, trim, unwind};
 use futures::StreamExt;
+use per_share::PerShare;
 use sdk::transfers::{self, Account, Moved, VenueAccount};
 use sdk::{
     AccountState, Action, Decimal, Limits, Order, Query, Receipt, from_payload, millionths,
@@ -49,9 +51,9 @@ struct FundingBasis;
 struct Mind {
     settings: Settings,
     limits: Limits,
-    /// The most the vault has been worth while this instance watched it: what
-    /// the drawdown stop is measured from.
-    peak: Decimal,
+    /// The value of a vault share while this instance watched it, and its
+    /// peak: what the drawdown stop is measured on.
+    per_share: PerShare,
     /// How long to leave a plan the venue or the station refused.
     patience: Patience,
     /// The vault's cash that leavers are waiting on. Lost to a restart, which
@@ -65,7 +67,7 @@ impl Mind {
         Self {
             settings: Settings::shipped(),
             limits: limits(),
-            peak: Decimal::from(0),
+            per_share: PerShare::default(),
             patience: Patience::default(),
             leavers: Leavers::default(),
         }
@@ -140,9 +142,7 @@ fn venue() -> Account {
 /// for leavers.
 async fn step(mind: &mut Mind, brought_home: bool) -> Result<(), String> {
     let state = read_state().await?;
-    if state.vault_value > mind.peak {
-        mind.peak = state.vault_value;
-    }
+    mind.per_share.look(state.vault_value, decide::held(&state));
     if brought_home {
         mind.leavers.brought_home(&mind.limits, &state);
     } else {
@@ -151,7 +151,7 @@ async fn step(mind: &mut Mind, brought_home: bool) -> Result<(), String> {
     let plan = decide::decide(
         &mind.settings,
         &mind.limits,
-        mind.peak,
+        &mind.per_share,
         mind.leavers.held(),
         &state,
     );
@@ -346,7 +346,12 @@ mod tests {
         );
         assert!(manifest.contains("above 5% of the vault") && config::MAX_ORDER_FRACTION == "0.05");
         assert!(manifest.contains("6% of the vault kept liquid") && config::IDLE_BUFFER == "0.06");
-        assert!(manifest.contains("a 10% fall") && config::DRAWDOWN_STOP == "0.10");
+        assert!(
+            manifest.contains("a 10% fall in a vault share's value")
+                && config::DRAWDOWN_STOP == "0.10"
+        );
+        assert!(manifest.contains("a fall from before a restart is not remembered"));
+        assert!(!manifest.contains("fall from the vault's peak"));
         assert!(manifest.contains(config::SPOT) && manifest.contains(config::PERP));
     }
 }

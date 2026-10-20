@@ -17,10 +17,12 @@
 //! words.
 
 mod config;
+mod per_share;
 mod plan;
 mod venues;
 
 use futures::StreamExt;
+use per_share::PerShare;
 use plan::{Name, Picture, Step, zero};
 use sdk::streams::{
     self, CHAINLINK, ChainlinkFeed, ChainlinkValue, HYPERLIQUID, HyperliquidFeed, HyperliquidValue,
@@ -35,11 +37,11 @@ const FLATTEN_STEPS: usize = 64;
 
 struct Spot;
 
-/// What the agent remembers between steps: its venue, and the vault's peak
-/// since it started.
+/// What the agent remembers between steps: its venue, and the value of a
+/// vault share since it started, and its peak.
 struct Mind {
     venue: &'static config::Venue,
-    peak: Decimal,
+    per_share: PerShare,
     last_step: u64,
 }
 
@@ -64,7 +66,7 @@ impl sdk::Agent for Spot {
             .ok_or_else(|| format!("this agent trades on no venue on {home}"))?;
         let mut mind = Mind {
             venue,
-            peak: zero(),
+            per_share: PerShare::default(),
             last_step: 0,
         };
         let ticks = clock(venue)?;
@@ -154,9 +156,6 @@ async fn picture(mind: &mut Mind) -> Result<Picture, String> {
             .find(|balance| matches!(balance.account, Account::Vault))
             .map_or(0, |balance| balance.amount),
     );
-    if value > mind.peak {
-        mind.peak = value;
-    }
     let mut names = Vec::new();
     for (token, weight) in mind.venue.weights {
         // A token the driver doesn't list is not traded.
@@ -177,11 +176,13 @@ async fn picture(mind: &mut Mind) -> Result<Picture, String> {
             paused: price.paused,
         });
     }
+    mind.per_share.look(value, plan::held(&names));
     Ok(Picture {
         value,
         cash,
         safe_dollars: held.dollars,
-        peak: mind.peak,
+        share: mind.per_share.now,
+        peak: mind.per_share.peak,
         names,
     })
 }

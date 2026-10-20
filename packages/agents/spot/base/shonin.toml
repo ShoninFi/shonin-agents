@@ -12,13 +12,19 @@ station's Safe both check against Chainlink's ETH/USD price.
 
 A simple, bounded example of a spot strategy: what it earns is ether's \
 move on what it holds, and what a rebalance buys back cheaper than it sold.
+
+The agent can't read the vault's share price, so it measures a share's \
+value itself: from one look to the next, a share gains or loses what the \
+moves of Chainlink's prices did to what the vault held, so deposits and \
+withdrawals never move it. It starts again from a share's value at each \
+start of the agent, so a fall from before a restart is not remembered.
 """
 claims = [
     "Long only: holds WETH, 50% of the vault, and USDC",
     "Rebalances only once WETH is more than 3 points of the vault from its weight",
     "No single order above 5% of the vault",
     "Never trades while the pool is more than 2% from Chainlink's price",
-    "Only sells after a 10% fall from the vault's peak",
+    "Only sells after a 10% fall in a vault share's value from its peak since the agent last started, as it measures it from Chainlink's prices: deposits and withdrawals never count",
     "6% of the vault kept liquid, so an ordinary withdrawal closes nothing",
 ]
 

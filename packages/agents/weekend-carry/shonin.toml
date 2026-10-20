@@ -15,12 +15,20 @@ The position has no view on the stock: the token and the short move \
 together. What can go wrong is the gap widening before it closes, funding \
 turning against the short, and a weekend market too thin to leave at a \
 good price; the limits below are what bound it.
+
+The agent can't read the vault's share price, so it measures a share's \
+value itself: from one look to the next, a share gains or loses what the \
+moves of the tokens' Chainlink prices and of the perpetuals' books did to \
+what the vault held (funding and trading costs are not counted), so \
+deposits and withdrawals never move it. \
+It starts again from a share's value at each start of the agent, so \
+a fall from before a restart is not remembered.
 """
 claims = [
     "Gross exposure at most twice the vault's value",
     "No single order above 5% of the vault",
     "Three underlyings only: SPY, QQQ and NVDA, as stock tokens and as Lighter perpetuals",
-    "Both legs cut together after a 10% fall from the vault's peak",
+    "Both legs cut together after a 10% fall in a vault share's value from its peak since the agent last started, as it measures it from the tokens' Chainlink prices and the perpetuals' books: deposits and withdrawals never count",
     "Unwinds the perpetual first and the token second, never leaving a naked short",
     "6% of the vault kept liquid, so an ordinary withdrawal closes nothing",
 ]
