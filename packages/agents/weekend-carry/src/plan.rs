@@ -368,12 +368,15 @@ mod tests {
         assert!(!manifest.contains("fall from the vault's peak"));
         assert!(manifest.contains("couldn't be read"));
         assert!(manifest.contains(
-            "the stop holds until then, a read that fails never restarts it, and a restart \
-             measures a share afresh"
+            "the stop holds until then, a read that fails outside a halt never restarts it, \
+             and a restart measures a share afresh"
         ));
         assert!(manifest.contains("opens nothing until the platform restarts the agent"));
         assert!(manifest.contains("the stop is cleared when the platform restarts"));
         assert!(manifest.contains("A read that fails is a look skipped"));
+        assert!(manifest.contains("a handover to another executor"));
+        assert!(manifest.contains("tank topped up after running dry"));
+        assert!(manifest.contains("read what the vault holds ends in error rather than as done"));
         assert!(manifest.contains("No single order above 5% of the vault, save a halt's"));
         assert!(!manifest.contains("lifts"));
     }

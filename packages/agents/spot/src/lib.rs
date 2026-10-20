@@ -350,13 +350,16 @@ async fn pause(
 
 /// Sell everything, one bounded order at a time, then bring the dollars
 /// home: a halt is an unwind with less time. A read that fails is looked
-/// again at after a pause, within the same bound of steps, rather than
-/// ending the agent.
+/// again at after a pause, within the same bound of steps; if the steps run
+/// out with the last look unread, the halt ends with an error rather than as
+/// wound down, so the platform starts the agent again within the halt's
+/// grace.
 async fn flatten(
     host: &impl Host,
     mind: &mut Mind,
     waking: &mut (impl Stream<Item = Woke> + Unpin),
 ) -> Result<(), String> {
+    let mut unread = None;
     for _ in 0..FLATTEN_STEPS {
         // A halt acts on a look the measure skipped too: see
         // `Picture::halting`.
@@ -364,12 +367,14 @@ async fn flatten(
             Ok(seen) => seen,
             Err(error) => {
                 host.note(&format!("halt's look skipped: a read failed: {error}"));
+                unread = Some(error);
                 if !pause(host, waking, config::HALT_LOOKS_AGAIN_AFTER).await {
                     break;
                 }
                 continue;
             }
         };
+        unread = None;
         let step = picture.halting(looked);
         if step == Step::Nothing || !act(host, mind.venue, &picture, step).await? {
             break;
@@ -388,7 +393,10 @@ async fn flatten(
             )
             .await;
     }
-    Ok(())
+    match unread {
+        Some(error) => Err(format!("the halt could not read what is held: {error}")),
+        None => Ok(()),
+    }
 }
 
 sdk::export_agent!(Spot);
@@ -615,5 +623,16 @@ mod tests {
     /// vault's does.
     fn then_waits(vault: impl Stream<Item = Woke> + Unpin) -> impl Stream<Item = Woke> + Unpin {
         vault.chain(futures::stream::pending())
+    }
+
+    #[test]
+    fn a_halt_that_cannot_read_what_is_held_never_ends_as_wound_down() {
+        let host = Fake::new();
+        let mut mind = Mind::new(Fake::venue());
+        host.failing.set(u32::MAX);
+        let mut waking = futures::stream::iter(std::iter::repeat_with(|| Woke::Tick).take(10_000));
+        let ended = futures::executor::block_on(flatten(&host, &mut mind, &mut waking));
+        assert!(ended.is_err(), "ended as wound down without reading");
+        assert_eq!(host.weth.get(), d("0.2"));
     }
 }

@@ -486,6 +486,23 @@ pub fn hedge(
     }
 }
 
+/// The legs held whose closing price hasn't been seen yet: the perpetual's
+/// ask while there is a short to buy back, and the spot's bid while there is
+/// spot beyond what is kept for sends home. An agent started again within a
+/// halt has seen neither book.
+pub fn unpriced(state: &AccountState, quotes: &Quotes) -> Vec<&'static str> {
+    let (spot, perp) = held(state);
+    let priced = |price: Option<Decimal>| price.is_some_and(|price| price > zero());
+    let mut missing = Vec::new();
+    if perp < zero() && !priced(quotes.perp.ask) {
+        missing.push(config::PERP);
+    }
+    if spot > decimal(config::HYPE_KEPT_FOR_SENDS_HOME) && !priced(quotes.spot.bid) {
+        missing.push(config::SPOT);
+    }
+    missing
+}
+
 /// One order's worth of the short bought back, if there is a short.
 pub fn unwind(limits: &Limits, state: &AccountState, quotes: &Quotes) -> Option<Order> {
     let (_, perp) = held(state);

@@ -28,9 +28,13 @@ starts, and a restart starts the measure afresh from a share's value then.
 
 The agent keeps nothing across a restart: its state starts empty each time \
 the platform starts it, so the stop is cleared when the platform restarts \
-the agent (a redeploy, a machine restart, a change to its allowances, or a \
-fault in the agent itself). A read that fails is a look skipped, not a \
-fault: it never restarts the agent, which looks again when next woken.
+the agent: a redeploy, a machine restart, a change to its allowances, its \
+tank topped up after running dry, a handover to another executor, or a \
+fault in the agent itself. A read that fails is a look skipped, not a \
+fault: it never restarts the agent, which looks again when next woken. \
+Within a halt it looks again after a pause, and a halt that still can't \
+read what the vault holds ends in error rather than as done, so the \
+platform starts the agent again within the halt's grace.
 """
 claims = [
     "Long only: holds WETH, 50% of the vault, and USDC",
@@ -38,7 +42,7 @@ claims = [
     "No single order above 5% of the vault, save a halt's closing orders",
     "Never trades while the pool is more than 2% from Chainlink's price",
     "Sells everything only after a 10% fall in a vault share's value from its peak since the agent last started, as it measures it from Chainlink's prices (deposits and withdrawals never count), or when the vault halts; otherwise it sells only to put a token back towards its weight",
-    "Once stopped, buys nothing until the platform restarts the agent (such as a redeploy or a machine restart): the stop holds until then, a read that fails never restarts it, and a restart measures a share afresh from its value then",
+    "Once stopped, buys nothing until the platform restarts the agent (such as a redeploy or a machine restart): the stop holds until then, a read that fails outside a halt never restarts it, and a restart measures a share afresh from its value then",
     "6% of the vault kept liquid, so an ordinary withdrawal closes nothing",
 ]
 

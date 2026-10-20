@@ -17,18 +17,21 @@
 //! Its limits are in `config.rs`, where the reviewer reads them.
 
 mod config;
+mod host;
 
 use futures::stream::PollNext;
 use futures::{Stream, StreamExt};
-use hl::{AccountState, Action, Order, OrderRef, Side, Tif};
+use hl::{AccountState, Action, Order, OrderRef, Receipt, Side, Tif};
+use host::{Host, Sdk};
 use sdk::streams::{self, HYPERLIQUID, HyperliquidFeed, HyperliquidValue};
 use sdk::{Decimal, decimal, drivers, from_payload, to_payload, vault};
 use strategy_sdk as sdk;
 use strategy_sdk::hyperliquid as hl;
 
 const DRIVER: &str = hl::DRIVER;
-/// How many steps a halt may take to close the inventory.
-const FLATTEN_STEPS: usize = 16;
+/// How many looks a halt may take to cancel what rests and close the
+/// inventory.
+const FLATTEN_STEPS: usize = 64;
 
 struct MmQuoter;
 
@@ -161,9 +164,9 @@ enum Woke {
     Nothing,
 }
 
-impl sdk::Agent for MmQuoter {
-    async fn run() -> Result<(), String> {
-        let mind = Mind {
+impl Mind {
+    fn new() -> Self {
+        Self {
             best_bid: None,
             best_ask: None,
             now_ms: 0,
@@ -172,7 +175,13 @@ impl sdk::Agent for MmQuoter {
             levered: false,
             dead_man: DeadMan::default(),
             swept: false,
-        };
+        }
+    }
+}
+
+impl sdk::Agent for MmQuoter {
+    async fn run() -> Result<(), String> {
+        let mind = Mind::new();
         let book = streams::subscribe::<_, HyperliquidValue>(
             HYPERLIQUID,
             &HyperliquidFeed::Book {
@@ -195,7 +204,11 @@ impl sdk::Agent for MmQuoter {
             .map(|_| Woke::Venue);
         let vault_events = vault::events().into_stream().map(Woke::Vault);
         let others = futures::stream::select(book, account);
-        serve(&mut Live { mind }, vault_first(vault_events, others)).await
+        serve(
+            &mut Live { mind, host: Sdk },
+            vault_first(vault_events, others),
+        )
+        .await
     }
 }
 
@@ -210,23 +223,26 @@ trait Wakes {
     ) -> Result<(), String>;
     /// A fill, or a leaver's fraction being closed: the inventory changed.
     async fn inventory(&mut self) -> Result<(), String>;
-    /// The vault halts: take the quotes down and flatten.
-    async fn halt(&mut self) -> Result<(), String>;
+    /// The vault halts: take the quotes down and flatten, waking on
+    /// `waking` while it waits.
+    async fn halt(&mut self, waking: &mut (impl Stream<Item = Woke> + Unpin))
+    -> Result<(), String>;
 }
 
 /// The agent as it runs, on its venue.
-struct Live {
+struct Live<H> {
     mind: Mind,
+    host: H,
 }
 
-impl Wakes for Live {
+impl<H: Host> Wakes for Live<H> {
     async fn book(
         &mut self,
         bid: Option<Decimal>,
         ask: Option<Decimal>,
         at_ms: u64,
     ) -> Result<(), String> {
-        let mind = &mut self.mind;
+        let (mind, host) = (&mut self.mind, &self.host);
         mind.best_bid = bid;
         mind.best_ask = ask;
         mind.now_ms = at_ms;
@@ -240,11 +256,11 @@ impl Wakes for Live {
             mind.quotes = Quotes::default();
         }
         if !mind.dead_man.may_quote() {
-            stand_aside(mind).await?;
+            stand_aside(host, mind).await?;
         } else if moved_enough(mind) {
-            requote(mind).await?;
+            requote(host, mind).await?;
         } else if let Some(until) = mind.dead_man.renewal(at_ms) {
-            let verdicts = submit(&[Action::CancelAllAt { at_ms: Some(until) }]).await?;
+            let verdicts = submit(host, &[Action::CancelAllAt { at_ms: Some(until) }]).await?;
             if matches!(verdicts.first(), Some(sdk::Verdict::Accepted(_))) {
                 mind.dead_man.renewed(until);
             }
@@ -255,13 +271,16 @@ impl Wakes for Live {
     async fn inventory(&mut self) -> Result<(), String> {
         let mind = &mut self.mind;
         if mind.mid().is_some() && mind.dead_man.may_quote() {
-            requote(mind).await?;
+            requote(&self.host, mind).await?;
         }
         Ok(())
     }
 
-    async fn halt(&mut self) -> Result<(), String> {
-        flatten(&mut self.mind).await
+    async fn halt(
+        &mut self,
+        waking: &mut (impl Stream<Item = Woke> + Unpin),
+    ) -> Result<(), String> {
+        flatten(&self.host, &mut self.mind, waking).await
     }
 }
 
@@ -289,7 +308,7 @@ async fn serve(
                 agent.inventory().await?
             }
             Woke::Vault(vault::VaultEvent::BufferLow(_)) => {}
-            Woke::Vault(vault::VaultEvent::Halting(_)) => return agent.halt().await,
+            Woke::Vault(vault::VaultEvent::Halting(_)) => return agent.halt(&mut waking).await,
             Woke::Nothing => {}
         }
     }
@@ -314,8 +333,8 @@ fn moved_enough(mind: &Mind) -> bool {
     }
 }
 
-async fn read_state() -> Result<AccountState, String> {
-    from_payload(&drivers::account_state(DRIVER.to_string(), Vec::new()).await?)
+async fn read_state(host: &impl Host) -> Result<AccountState, String> {
+    from_payload(&host.account_state(DRIVER, Vec::new()).await?)
 }
 
 fn inventory(state: &AccountState) -> Decimal {
@@ -362,16 +381,19 @@ fn quotes_for(mid: Decimal, inventory: Decimal, vault_value: Decimal) -> (Quote,
 
 /// Cancel the quotes resting, push the venue's deadline back, and post new
 /// ones around the mid.
-async fn requote(mind: &mut Mind) -> Result<(), String> {
+async fn requote(host: &impl Host, mind: &mut Mind) -> Result<(), String> {
     let Some(mid) = mind.mid() else {
         return Ok(());
     };
-    let state = read_state().await?;
+    let state = read_state(host).await?;
     if !mind.levered {
-        let verdicts = submit(&[Action::Leverage {
-            market: config::MARKET.into(),
-            leverage: config::LEVERAGE,
-        }])
+        let verdicts = submit(
+            host,
+            &[Action::Leverage {
+                market: config::MARKET.into(),
+                leverage: config::LEVERAGE,
+            }],
+        )
         .await?;
         mind.levered = matches!(verdicts.first(), Some(sdk::Verdict::Accepted(_)));
     }
@@ -400,7 +422,7 @@ async fn requote(mind: &mut Mind) -> Result<(), String> {
         actions.push(Action::Place(quote(Side::Sell, price, size, id)));
     }
     mind.quotes.mid = Some(mid);
-    let verdicts = submit(&actions).await?;
+    let verdicts = submit(host, &actions).await?;
     mind.swept = true;
     if let Some((at, until)) = renewal
         && matches!(verdicts.get(at), Some(sdk::Verdict::Accepted(_)))
@@ -412,7 +434,7 @@ async fn requote(mind: &mut Mind) -> Result<(), String> {
 
 /// Pull the quotes and take the deadline off, once: the deadline has run out
 /// too often today for the venue to be relied on to fire it again.
-async fn stand_aside(mind: &mut Mind) -> Result<(), String> {
+async fn stand_aside(host: &impl Host, mind: &mut Mind) -> Result<(), String> {
     if mind.quotes.bid.is_none() && mind.quotes.ask.is_none() && mind.dead_man.deadline_ms.is_none()
     {
         return Ok(());
@@ -420,7 +442,7 @@ async fn stand_aside(mind: &mut Mind) -> Result<(), String> {
     let mut actions = cancels(&mut mind.quotes);
     actions.push(mind.dead_man.clear());
     mind.quotes.mid = None;
-    submit(&actions).await.map(|_| ())
+    submit(host, &actions).await.map(|_| ())
 }
 
 /// Cancels, by the venue's ids, for every order resting on the agent's
@@ -461,32 +483,110 @@ fn quote(side: Side, price: Decimal, size: Decimal, id: u128) -> Order {
     }
 }
 
-/// Pull the quotes and close the inventory, reduce-only, at the book.
-async fn flatten(mind: &mut Mind) -> Result<(), String> {
-    let mut actions = cancels(&mut mind.quotes);
-    actions.push(mind.dead_man.clear());
-    submit(&actions).await?;
+/// Take every order off the market, then close the inventory, reduce-only,
+/// at the book.
+///
+/// An agent started again within a halt remembers no quote and has seen no
+/// book, while what an earlier instance left may still rest. So each look
+/// reads the account and cancels every order resting on the market, whoever
+/// placed it, and the venue's cancel-everything deadline is taken off only
+/// once a look finds nothing resting: until then it stays behind whatever
+/// rests. The inventory is closed only at a price from a book this instance
+/// has seen, and while there is none yet it waits for one, keeping each book
+/// that arrives. After cancels it looks again at once; a look that couldn't
+/// finish (a read failed, an order still rests after that, no book yet, a
+/// close the venue didn't fill) is taken again after a pause. It ends cleanly once nothing rests and the inventory is flat, or
+/// the market would not take the close; if the looks run out with an order
+/// that may still rest, or inventory unread or unpriced, it ends with an
+/// error rather than as wound down, so the platform starts it again within
+/// the halt's grace.
+async fn flatten(
+    host: &impl Host,
+    mind: &mut Mind,
+    waking: &mut (impl Stream<Item = Woke> + Unpin),
+) -> Result<(), String> {
+    let mut unseen = String::new();
+    let mut deadline_off = false;
+    // Whether the last look sent cancels: the next looks again at once, to
+    // see that nothing rests, and one after that waits first.
+    let mut just_cancelled = false;
     for _ in 0..FLATTEN_STEPS {
-        let held = inventory(&read_state().await?);
-        if held == zero() {
-            return Ok(());
+        unseen.clear();
+        match read_state(host).await {
+            Err(error) => unseen = format!("a read failed: {error}"),
+            Ok(state) => {
+                // Its own quotes by its ids, and everything the account
+                // shows resting by the venue's (its own among them, which
+                // the venue then refuses as already gone).
+                let mut resting = cancels(&mut mind.quotes);
+                resting.extend(strays(&state));
+                if !resting.is_empty() {
+                    submit(host, &resting).await?;
+                    unseen = "orders may still rest on the market".into();
+                    if !just_cancelled {
+                        just_cancelled = true;
+                        continue;
+                    }
+                } else {
+                    just_cancelled = false;
+                    if !deadline_off {
+                        // Nothing rests for the deadline to pull.
+                        submit(host, &[mind.dead_man.clear()]).await?;
+                        deadline_off = true;
+                    }
+                    let held = inventory(&state);
+                    if held == zero() {
+                        return Ok(());
+                    }
+                    let (side, size, price) = if held > zero() {
+                        (Side::Sell, held, mind.best_bid)
+                    } else {
+                        (Side::Buy, zero() - held, mind.best_ask)
+                    };
+                    match price.filter(|price| *price > zero()) {
+                        None => unseen = "no book seen yet for the inventory".into(),
+                        Some(price) => {
+                            if close(host, side, size, price).await? {
+                                continue;
+                            }
+                            // Not filled: try again after a pause.
+                        }
+                    }
+                }
+            }
         }
-        let (side, size, price) = if held > zero() {
-            (Side::Sell, held, mind.best_bid)
-        } else {
-            (Side::Buy, zero() - held, mind.best_ask)
-        };
-        let Some(price) = price else {
-            return Ok(());
-        };
-        // A wide reach: the vault is stopping, and the contract closes
-        // whatever this leaves inside its own band.
-        let reach = decimal("0.01");
-        let limit = match side {
-            Side::Sell => price * (one() - reach),
-            Side::Buy => price * (one() + reach),
-        };
-        submit(&[Action::Place(Order {
+        if !unseen.is_empty() {
+            host.note(&format!("halt waiting to look again: {unseen}"));
+        }
+        if !pause(host, mind, waking, config::HALT_LOOKS_AGAIN_AFTER).await {
+            break;
+        }
+    }
+    if unseen.is_empty() {
+        // The market would not take the close: the contract closes the rest.
+        return Ok(());
+    }
+    Err(format!("the halt left the market unsettled: {unseen}"))
+}
+
+/// Close `size` of the inventory, immediate-or-cancel and reduce-only, and
+/// say whether any of it filled.
+async fn close(
+    host: &impl Host,
+    side: Side,
+    size: Decimal,
+    price: Decimal,
+) -> Result<bool, String> {
+    // A wide reach: the vault is stopping, and the contract closes whatever
+    // this leaves inside its own band.
+    let reach = decimal("0.01");
+    let limit = match side {
+        Side::Sell => price * (one() - reach),
+        Side::Buy => price * (one() + reach),
+    };
+    let verdicts = submit(
+        host,
+        &[Action::Place(Order {
             market: config::MARKET.into(),
             side,
             size,
@@ -494,10 +594,40 @@ async fn flatten(mind: &mut Mind) -> Result<(), String> {
             tif: Tif::Ioc,
             reduce_only: true,
             client_id: None,
-        })])
-        .await?;
+        })],
+    )
+    .await?;
+    let Some(sdk::Verdict::Accepted(receipt)) = verdicts.first() else {
+        return Ok(false);
+    };
+    Ok(matches!(
+        from_payload::<Receipt>(receipt),
+        Ok(Receipt::Filled { size, .. }) if size > zero()
+    ))
+}
+
+/// Wait at least `seconds` on whatever wakes the agent, which has no timer
+/// of its own, keeping each book that arrives meanwhile; false once nothing
+/// will wake it again.
+async fn pause(
+    host: &impl Host,
+    mind: &mut Mind,
+    waking: &mut (impl Stream<Item = Woke> + Unpin),
+    seconds: u64,
+) -> bool {
+    let until = host.now() + seconds;
+    while host.now() < until {
+        match waking.next().await {
+            Some(Woke::Book { bid, ask, at_ms }) => {
+                mind.best_bid = bid;
+                mind.best_ask = ask;
+                mind.now_ms = at_ms;
+            }
+            Some(_) => {}
+            None => return false,
+        }
     }
-    Ok(())
+    true
 }
 
 fn round_down(size: Decimal, decimals: u32) -> Decimal {
@@ -527,9 +657,9 @@ fn five_figures(price: Decimal, side: Side) -> Decimal {
     rounded / scale
 }
 
-async fn submit(actions: &[Action]) -> Result<Vec<sdk::Verdict>, String> {
+async fn submit(host: &impl Host, actions: &[Action]) -> Result<Vec<sdk::Verdict>, String> {
     let encoded: Vec<Vec<u8>> = actions.iter().map(to_payload).collect();
-    Ok(drivers::submit(DRIVER.to_string(), encoded).await)
+    Ok(host.submit(DRIVER, encoded).await)
 }
 
 sdk::export_agent!(MmQuoter);
@@ -681,6 +811,10 @@ mod tests {
         assert_eq!(config::STOP_AFTER_FIRES, 8);
         assert!(manifest.contains("leverage 3") && config::LEVERAGE == 3);
         assert!(manifest.contains("ETH perpetual") && config::MARKET == "ETH");
+        assert!(manifest.contains("cancels every order resting on its market, whoever"));
+        assert!(manifest.contains("takes the venue's deadline off only once nothing rests"));
+        assert!(manifest.contains("rest or its inventory is unpriced: such a halt ends in error"));
+        assert!(manifest.contains("a handover to another executor"));
     }
 
     /// Notes what each wake did.
@@ -703,7 +837,7 @@ mod tests {
             Ok(())
         }
 
-        async fn halt(&mut self) -> Result<(), String> {
+        async fn halt(&mut self, _: &mut (impl Stream<Item = Woke> + Unpin)) -> Result<(), String> {
             self.0.push("halt");
             Ok(())
         }
@@ -726,5 +860,232 @@ mod tests {
         );
         futures::executor::block_on(serve(&mut noted, vault_first(vault, book))).unwrap();
         assert_eq!(noted.0, ["halt"], "quoted within the halt");
+    }
+
+    use std::cell::{Cell, RefCell};
+
+    /// A stand-in venue: one account with a position on the market and the
+    /// orders resting there, which cancels what it is asked to by the
+    /// venue's ids, fills every closing order in full, and refuses cancels
+    /// while told to.
+    struct Fake {
+        clock: Cell<u64>,
+        state: RefCell<AccountState>,
+        /// The venue's cancel-everything deadline, as last set.
+        deadline: Cell<Option<u64>>,
+        refusing_cancels: Cell<bool>,
+        log: RefCell<Vec<Action>>,
+    }
+
+    impl Fake {
+        /// Long `held` ETH, with `resting` orders on ETH (an earlier
+        /// instance's quotes) and one on another market, behind a deadline
+        /// the earlier instance set.
+        fn new(held: &str, resting: &[u64]) -> Self {
+            let order = |market: &str, order_id| hl::OpenOrder {
+                market: market.into(),
+                order_id,
+                side: Side::Buy,
+                size: decimal("0.07"),
+                limit_price: decimal("2690"),
+            };
+            let mut open_orders: Vec<hl::OpenOrder> = resting
+                .iter()
+                .map(|id| order(config::MARKET, *id))
+                .collect();
+            open_orders.push(order("HYPE", 99));
+            Self {
+                clock: Cell::new(1_000_000),
+                state: RefCell::new(AccountState {
+                    vault_value: decimal("10000"),
+                    idle: zero(),
+                    station_idle: zero(),
+                    account_value: decimal("3000"),
+                    withdrawable: zero(),
+                    positions: vec![hl::Position {
+                        market: config::MARKET.into(),
+                        size: decimal(held),
+                        entry_price: None,
+                        leverage: config::LEVERAGE,
+                    }],
+                    spot: Vec::new(),
+                    open_orders,
+                }),
+                deadline: Cell::new(Some(1_000_030_000)),
+                refusing_cancels: Cell::new(false),
+                log: RefCell::new(Vec::new()),
+            }
+        }
+
+        fn resting_on_the_market(&self) -> usize {
+            self.state
+                .borrow()
+                .open_orders
+                .iter()
+                .filter(|order| order.market == config::MARKET)
+                .count()
+        }
+
+        fn held(&self) -> Decimal {
+            inventory(&self.state.borrow())
+        }
+    }
+
+    impl Host for Fake {
+        fn now(&self) -> u64 {
+            // Each look at the clock is a second on.
+            self.clock.set(self.clock.get() + 1);
+            self.clock.get()
+        }
+
+        fn note(&self, _: &str) {}
+
+        async fn account_state(&self, _: &str, _: Vec<u8>) -> Result<Vec<u8>, String> {
+            Ok(to_payload(&*self.state.borrow()))
+        }
+
+        async fn submit(&self, _: &str, actions: Vec<Vec<u8>>) -> Vec<sdk::Verdict> {
+            let mut verdicts = Vec::new();
+            for action in actions {
+                let action = from_payload::<Action>(&action).unwrap();
+                self.log.borrow_mut().push(action.clone());
+                let mut state = self.state.borrow_mut();
+                let receipt = match action {
+                    Action::Cancel { .. } if self.refusing_cancels.get() => {
+                        verdicts.push(sdk::Verdict::Rejected("the venue is busy".into()));
+                        continue;
+                    }
+                    Action::Cancel {
+                        order: OrderRef::Venue(id),
+                        ..
+                    } => {
+                        state.open_orders.retain(|order| order.order_id != id);
+                        Receipt::Done
+                    }
+                    Action::CancelAllAt { at_ms } => {
+                        self.deadline.set(at_ms);
+                        Receipt::Done
+                    }
+                    Action::Place(order) if order.reduce_only => {
+                        let position = &mut state.positions[0];
+                        position.size += match order.side {
+                            Side::Buy => order.size,
+                            Side::Sell => zero() - order.size,
+                        };
+                        Receipt::Filled {
+                            order_id: 1,
+                            size: order.size,
+                            average_price: order.limit_price,
+                        }
+                    }
+                    Action::Place(_) => Receipt::Resting { order_id: 2 },
+                    _ => Receipt::Done,
+                };
+                verdicts.push(sdk::Verdict::Accepted(to_payload(&receipt)));
+            }
+            verdicts
+        }
+    }
+
+    fn halting() -> impl Stream<Item = Woke> + Unpin {
+        let halting = Woke::Vault(vault::VaultEvent::Halting("halted".into()));
+        futures::stream::iter([halting]).chain(futures::stream::pending())
+    }
+
+    fn books() -> impl Stream<Item = Woke> + Unpin {
+        futures::stream::iter(
+            std::iter::repeat_with(|| Woke::Book {
+                bid: Some(decimal("2699")),
+                ask: Some(decimal("2701")),
+                at_ms: 1_000_000_000,
+            })
+            .take(1_000),
+        )
+    }
+
+    #[test]
+    fn a_start_inside_a_halt_cancels_the_quotes_an_earlier_instance_left_and_closes_the_inventory()
+    {
+        let mut agent = Live {
+            mind: Mind::new(),
+            host: Fake::new("0.5", &[7, 8]),
+        };
+        futures::executor::block_on(serve(&mut agent, vault_first(halting(), books())))
+            .expect("the halt ended in error");
+        let host = &agent.host;
+        assert_eq!(
+            host.resting_on_the_market(),
+            0,
+            "an earlier quote still rests"
+        );
+        assert_eq!(host.held(), zero(), "the inventory was left open");
+        assert_eq!(
+            host.state.borrow().open_orders.len(),
+            1,
+            "touched another market"
+        );
+        let log = host.log.borrow();
+        let cleared = log
+            .iter()
+            .position(|action| *action == Action::CancelAllAt { at_ms: None })
+            .expect("the deadline was never taken off");
+        let last_cancel = log
+            .iter()
+            .rposition(|action| matches!(action, Action::Cancel { .. }))
+            .unwrap();
+        assert!(
+            cleared > last_cancel,
+            "the deadline came off before the quotes"
+        );
+        assert!(
+            log.iter().all(|action| !matches!(
+                action,
+                Action::Place(order) if !order.reduce_only
+            )),
+            "quoted within the halt"
+        );
+    }
+
+    #[test]
+    fn a_halt_that_never_sees_a_book_closes_nothing_and_never_ends_as_wound_down() {
+        let mut agent = Live {
+            mind: Mind::new(),
+            host: Fake::new("0.5", &[7]),
+        };
+        // Only the account's events: no book comes.
+        let venue = futures::stream::iter(std::iter::repeat_with(|| Woke::Venue).take(10_000));
+        let ended = futures::executor::block_on(serve(&mut agent, vault_first(halting(), venue)));
+        assert!(
+            ended.is_err(),
+            "ended as wound down with inventory unpriced"
+        );
+        let host = &agent.host;
+        assert_eq!(
+            host.resting_on_the_market(),
+            0,
+            "an earlier quote still rests"
+        );
+        assert_eq!(host.held(), decimal("0.5"));
+        assert!(
+            host.log
+                .borrow()
+                .iter()
+                .all(|action| !matches!(action, Action::Place(_))),
+            "traded at a price it never saw"
+        );
+    }
+
+    #[test]
+    fn a_halt_whose_cancels_are_refused_keeps_the_deadline_and_never_ends_as_wound_down() {
+        let mut agent = Live {
+            mind: Mind::new(),
+            host: Fake::new("0", &[7, 8]),
+        };
+        agent.host.refusing_cancels.set(true);
+        let ended = futures::executor::block_on(serve(&mut agent, vault_first(halting(), books())));
+        assert!(ended.is_err(), "ended as wound down with quotes resting");
+        let host = &agent.host;
+        assert_eq!(host.resting_on_the_market(), 2);
+        assert!(host.deadline.get().is_some(), "the deadline came off");
     }
 }
