@@ -440,6 +440,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
+name = "spot"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "serde",
+ "shonin-strategy-sdk",
+]
+
+[[package]]
+name = "spot-base"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "serde",
+ "shonin-strategy-sdk",
+]
+
+[[package]]
 name = "syn"
 version = "2.0.119"
 source = "registry+https://github.com/rust-lang/crates.io-index"

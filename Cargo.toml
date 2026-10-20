@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["packages/agents/funding-basis", "packages/agents/funding-basis/hyperliquid", "packages/agents/funding-basis/solana", "packages/agents/mm-quoter", "packages/agents/mm-quoter/solana", "packages/agents/weekend-carry", "packages/agents/catalyst"]
+members = ["packages/agents/funding-basis", "packages/agents/funding-basis/hyperliquid", "packages/agents/funding-basis/solana", "packages/agents/mm-quoter", "packages/agents/mm-quoter/solana", "packages/agents/weekend-carry", "packages/agents/catalyst", "packages/agents/spot", "packages/agents/spot/base"]
 
 [workspace.package]
 version = "0.1.0"

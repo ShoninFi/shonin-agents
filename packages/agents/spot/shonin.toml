@@ -1,0 +1,26 @@
+[vault]
+chain = "robinhood"
+
+[description]
+title = "Spot"
+text = """
+Holds four of Robinhood Chain's stock tokens at fixed weights against the \
+chain's dollar, and puts each back to its weight when the market has moved \
+it more than three points of the vault away. Nothing else: no leverage, no \
+short, no view beyond the weights. It trades through the stock-token \
+driver, whose swaps the executor and the token's Safe both check against \
+the token's Chainlink price.
+
+A simple, bounded example of a spot strategy: what it earns is the market's \
+move on what it holds, and what a rebalance buys back cheaper than it sold.
+"""
+claims = [
+    "Long only: holds TSLA, AMD, AMZN and PLTR stock tokens, 15% of the vault each, and dollars",
+    "Rebalances a token only once it is more than 3 points of the vault from its weight",
+    "No single order above 5% of the vault",
+    "Never trades a token whose pool is more than 2% from its Chainlink price, or whose oracle is paused",
+    "Only sells after a 10% fall from the vault's peak",
+    "6% of the vault kept liquid, so an ordinary withdrawal closes nothing",
+]
+
+[drivers.robinhood]

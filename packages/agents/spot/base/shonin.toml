@@ -1,0 +1,25 @@
+[vault]
+chain = "base"
+
+[description]
+title = "Spot on Base"
+text = """
+Holds WETH at a fixed weight against USDC on Base, and puts it back to its \
+weight when the market has moved it more than three points of the vault \
+away. Nothing else: no leverage, no short, no view beyond the weight. It \
+trades on Uniswap v3 through a driver whose swaps the executor and the \
+station's Safe both check against Chainlink's ETH/USD price.
+
+A simple, bounded example of a spot strategy: what it earns is ether's \
+move on what it holds, and what a rebalance buys back cheaper than it sold.
+"""
+claims = [
+    "Long only: holds WETH, 50% of the vault, and USDC",
+    "Rebalances only once WETH is more than 3 points of the vault from its weight",
+    "No single order above 5% of the vault",
+    "Never trades while the pool is more than 2% from Chainlink's price",
+    "Only sells after a 10% fall from the vault's peak",
+    "6% of the vault kept liquid, so an ordinary withdrawal closes nothing",
+]
+
+[drivers.uniswap-base]
