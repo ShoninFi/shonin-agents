@@ -16,7 +16,8 @@
 //! and the stop holds until the agent next starts: nothing lifts it. The
 //! measure goes on following what the vault actually holds, so once sold
 //! out it stays where the selling left it. A restart starts the measure,
-//! and the stop with it, afresh.
+//! and the stop with it, afresh; the agents skip a look whose read fails
+//! rather than fault, so a failed read is never a restart.
 
 use strategy_sdk::{Decimal, decimal};
 

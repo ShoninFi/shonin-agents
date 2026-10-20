@@ -18,7 +18,8 @@
 
 mod config;
 
-use futures::StreamExt;
+use futures::stream::PollNext;
+use futures::{Stream, StreamExt};
 use hl::{AccountState, Action, Order, OrderRef, Side, Tif};
 use sdk::streams::{self, HYPERLIQUID, HyperliquidFeed, HyperliquidValue};
 use sdk::{Decimal, decimal, drivers, from_payload, to_payload, vault};
@@ -162,7 +163,7 @@ enum Woke {
 
 impl sdk::Agent for MmQuoter {
     async fn run() -> Result<(), String> {
-        let mut mind = Mind {
+        let mind = Mind {
             best_bid: None,
             best_ask: None,
             now_ms: 0,
@@ -193,55 +194,106 @@ impl sdk::Agent for MmQuoter {
             .into_stream()
             .map(|_| Woke::Venue);
         let vault_events = vault::events().into_stream().map(Woke::Vault);
-        let mut waking = futures::stream::select_all([
-            book.boxed_local(),
-            account.boxed_local(),
-            vault_events.boxed_local(),
-        ]);
+        let others = futures::stream::select(book, account);
+        serve(&mut Live { mind }, vault_first(vault_events, others)).await
+    }
+}
 
-        while let Some(woke) = waking.next().await {
-            match woke {
-                Woke::Book { bid, ask, at_ms } => {
-                    mind.best_bid = bid;
-                    mind.best_ask = ask;
-                    mind.now_ms = at_ms;
-                    // Ids carry the time, so a restarted agent never reuses
-                    // one its predecessor left resting.
-                    if mind.next_id == 0 {
-                        mind.next_id = u128::from(at_ms) << 32;
-                    }
-                    if mind.dead_man.observe(at_ms) {
-                        // The venue cancelled everything: nothing rests.
-                        mind.quotes = Quotes::default();
-                    }
-                    if !mind.dead_man.may_quote() {
-                        stand_aside(&mut mind).await?;
-                    } else if moved_enough(&mind) {
-                        requote(&mut mind).await?;
-                    } else if let Some(until) = mind.dead_man.renewal(at_ms) {
-                        let verdicts =
-                            submit(&[Action::CancelAllAt { at_ms: Some(until) }]).await?;
-                        if matches!(verdicts.first(), Some(sdk::Verdict::Accepted(_))) {
-                            mind.dead_man.renewed(until);
-                        }
-                    }
-                }
-                // A fill changes the inventory: lean the quotes again.
-                Woke::Venue | Woke::Vault(vault::VaultEvent::ClaimPending(_)) => {
-                    if mind.mid().is_some() && mind.dead_man.may_quote() {
-                        requote(&mut mind).await?;
-                    }
-                }
-                Woke::Vault(vault::VaultEvent::BufferLow(_)) => {}
-                Woke::Vault(vault::VaultEvent::Halting(_)) => {
-                    flatten(&mut mind).await?;
-                    return Ok(());
-                }
-                Woke::Nothing => {}
+/// What the agent does on a wake.
+trait Wakes {
+    /// A new top of the book, as received at `at_ms`.
+    async fn book(
+        &mut self,
+        bid: Option<Decimal>,
+        ask: Option<Decimal>,
+        at_ms: u64,
+    ) -> Result<(), String>;
+    /// A fill, or a leaver's fraction being closed: the inventory changed.
+    async fn inventory(&mut self) -> Result<(), String>;
+    /// The vault halts: take the quotes down and flatten.
+    async fn halt(&mut self) -> Result<(), String>;
+}
+
+/// The agent as it runs, on its venue.
+struct Live {
+    mind: Mind,
+}
+
+impl Wakes for Live {
+    async fn book(
+        &mut self,
+        bid: Option<Decimal>,
+        ask: Option<Decimal>,
+        at_ms: u64,
+    ) -> Result<(), String> {
+        let mind = &mut self.mind;
+        mind.best_bid = bid;
+        mind.best_ask = ask;
+        mind.now_ms = at_ms;
+        // Ids carry the time, so a restarted agent never reuses one its
+        // predecessor left resting.
+        if mind.next_id == 0 {
+            mind.next_id = u128::from(at_ms) << 32;
+        }
+        if mind.dead_man.observe(at_ms) {
+            // The venue cancelled everything: nothing rests.
+            mind.quotes = Quotes::default();
+        }
+        if !mind.dead_man.may_quote() {
+            stand_aside(mind).await?;
+        } else if moved_enough(mind) {
+            requote(mind).await?;
+        } else if let Some(until) = mind.dead_man.renewal(at_ms) {
+            let verdicts = submit(&[Action::CancelAllAt { at_ms: Some(until) }]).await?;
+            if matches!(verdicts.first(), Some(sdk::Verdict::Accepted(_))) {
+                mind.dead_man.renewed(until);
             }
         }
         Ok(())
     }
+
+    async fn inventory(&mut self) -> Result<(), String> {
+        let mind = &mut self.mind;
+        if mind.mid().is_some() && mind.dead_man.may_quote() {
+            requote(mind).await?;
+        }
+        Ok(())
+    }
+
+    async fn halt(&mut self) -> Result<(), String> {
+        flatten(&mut self.mind).await
+    }
+}
+
+/// What wakes the agent, the vault's news always taken before anything
+/// else that is waiting: an agent started again within a halt finds the
+/// halting notice first in the vault's news, and must see it before it
+/// quotes.
+fn vault_first(
+    vault: impl Stream<Item = Woke> + Unpin,
+    others: impl Stream<Item = Woke> + Unpin,
+) -> impl Stream<Item = Woke> + Unpin {
+    futures::stream::select_with_strategy(vault, others, |_: &mut ()| PollNext::Left)
+}
+
+/// Act on each wake until the vault halts.
+async fn serve(
+    agent: &mut impl Wakes,
+    mut waking: impl Stream<Item = Woke> + Unpin,
+) -> Result<(), String> {
+    while let Some(woke) = waking.next().await {
+        match woke {
+            Woke::Book { bid, ask, at_ms } => agent.book(bid, ask, at_ms).await?,
+            // A fill changes the inventory: lean the quotes again.
+            Woke::Venue | Woke::Vault(vault::VaultEvent::ClaimPending(_)) => {
+                agent.inventory().await?
+            }
+            Woke::Vault(vault::VaultEvent::BufferLow(_)) => {}
+            Woke::Vault(vault::VaultEvent::Halting(_)) => return agent.halt().await,
+            Woke::Nothing => {}
+        }
+    }
+    Ok(())
 }
 
 /// Whether the mid has moved far enough from where the quotes were set.
@@ -629,5 +681,50 @@ mod tests {
         assert_eq!(config::STOP_AFTER_FIRES, 8);
         assert!(manifest.contains("leverage 3") && config::LEVERAGE == 3);
         assert!(manifest.contains("ETH perpetual") && config::MARKET == "ETH");
+    }
+
+    /// Notes what each wake did.
+    #[derive(Default)]
+    struct Noted(Vec<&'static str>);
+
+    impl Wakes for Noted {
+        async fn book(
+            &mut self,
+            _: Option<Decimal>,
+            _: Option<Decimal>,
+            _: u64,
+        ) -> Result<(), String> {
+            self.0.push("book");
+            Ok(())
+        }
+
+        async fn inventory(&mut self) -> Result<(), String> {
+            self.0.push("inventory");
+            Ok(())
+        }
+
+        async fn halt(&mut self) -> Result<(), String> {
+            self.0.push("halt");
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_start_inside_a_halt_quotes_nothing_and_goes_to_flatten() {
+        let mut noted = Noted::default();
+        // Started again within the halt: the notice waits first in the
+        // vault's news, and the book is there from the start too.
+        let halting = Woke::Vault(vault::VaultEvent::Halting("halted".into()));
+        let vault = futures::stream::iter([halting]).chain(futures::stream::pending());
+        let book = futures::stream::iter(
+            std::iter::repeat_with(|| Woke::Book {
+                bid: Some(decimal("99")),
+                ask: Some(decimal("101")),
+                at_ms: 1,
+            })
+            .take(100),
+        );
+        futures::executor::block_on(serve(&mut noted, vault_first(vault, book))).unwrap();
+        assert_eq!(noted.0, ["halt"], "quoted within the halt");
     }
 }

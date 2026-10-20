@@ -19,7 +19,8 @@ mod venues;
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use futures::StreamExt;
+use futures::stream::PollNext;
+use futures::{Stream, StreamExt};
 use sdk::inference::{self, NamedTensor, Tensor, TensorData};
 use sdk::streams::{self, CHAINLINK, ChainlinkFeed, ChainlinkValue};
 use sdk::transfers::{self, Account, Moved, VenueAccount};
@@ -58,7 +59,7 @@ fn zero() -> Decimal {
 
 impl sdk::Agent for Catalyst {
     async fn run() -> Result<(), String> {
-        let mut mind = Mind {
+        let mind = Mind {
             seen: BTreeSet::new(),
             entries: BTreeMap::new(),
             last_read: 0,
@@ -77,24 +78,69 @@ impl sdk::Agent for Catalyst {
         }
         let ticks = futures::stream::select_all(ticks).map(|_| None);
         let vault_events = vault::events().into_stream().map(Some);
-        let mut waking = futures::stream::select(ticks, vault_events);
-        step(&mut mind).await?;
-        while let Some(woke) = waking.next().await {
-            match woke {
-                Some(vault::VaultEvent::Halting(_)) => {
-                    for (token, _) in config::NAMES {
-                        sell_all(token).await?;
-                    }
-                    return Ok(());
-                }
-                Some(vault::VaultEvent::BufferLow(short)) => {
-                    let _ = transfers::move_(venue(), Account::Vault, short).await;
-                }
-                _ => step(&mut mind).await?,
-            }
+        serve(&mut Live { mind }, vault_first(vault_events, ticks)).await
+    }
+}
+
+/// What the agent does on a wake.
+trait Wakes {
+    /// An ordinary step: read new filings, act on any strong one, and close
+    /// what is due.
+    async fn step(&mut self) -> Result<(), String>;
+    /// The vault halts: sell everything.
+    async fn halt(&mut self) -> Result<(), String>;
+    /// Leavers wait on `short` more cash than the vault holds.
+    async fn buffer_low(&mut self, short: u64);
+}
+
+/// The agent as it runs, on its venue.
+struct Live {
+    mind: Mind,
+}
+
+impl Wakes for Live {
+    async fn step(&mut self) -> Result<(), String> {
+        step(&mut self.mind).await
+    }
+
+    async fn halt(&mut self) -> Result<(), String> {
+        for (token, _) in config::NAMES {
+            sell_all(token).await?;
         }
         Ok(())
     }
+
+    async fn buffer_low(&mut self, short: u64) {
+        let _ = transfers::move_(venue(), Account::Vault, short).await;
+    }
+}
+
+/// What wakes the agent (a vault event, or a tick as `None`), the vault's
+/// news always taken before anything else that is waiting: an agent started
+/// again within a halt finds the halting notice first in the vault's news,
+/// and must see it before it takes an ordinary step.
+fn vault_first(
+    vault: impl Stream<Item = Option<vault::VaultEvent>> + Unpin,
+    ticks: impl Stream<Item = Option<vault::VaultEvent>> + Unpin,
+) -> impl Stream<Item = Option<vault::VaultEvent>> + Unpin {
+    futures::stream::select_with_strategy(vault, ticks, |_: &mut ()| PollNext::Left)
+}
+
+/// Act on each wake until the vault halts. There is no step before the
+/// first wake: the vault's news is read first, so a start within a halt
+/// goes straight to the halt, and the first step comes at the first tick.
+async fn serve(
+    agent: &mut impl Wakes,
+    mut waking: impl Stream<Item = Option<vault::VaultEvent>> + Unpin,
+) -> Result<(), String> {
+    while let Some(woke) = waking.next().await {
+        match woke {
+            Some(vault::VaultEvent::Halting(_)) => return agent.halt().await,
+            Some(vault::VaultEvent::BufferLow(short)) => agent.buffer_low(short).await,
+            _ => agent.step().await?,
+        }
+    }
+    Ok(())
 }
 
 fn venue() -> Account {
@@ -282,3 +328,40 @@ async fn sell_all(token: &str) -> Result<(), String> {
 }
 
 sdk::export_agent!(Catalyst);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Notes what each wake did.
+    #[derive(Default)]
+    struct Noted(Vec<&'static str>);
+
+    impl Wakes for Noted {
+        async fn step(&mut self) -> Result<(), String> {
+            self.0.push("step");
+            Ok(())
+        }
+
+        async fn halt(&mut self) -> Result<(), String> {
+            self.0.push("halt");
+            Ok(())
+        }
+
+        async fn buffer_low(&mut self, _: u64) {
+            self.0.push("buffer-low");
+        }
+    }
+
+    #[test]
+    fn a_start_inside_a_halt_buys_nothing_and_goes_to_the_halt() {
+        let mut noted = Noted::default();
+        // Started again within the halt: the notice waits first in the
+        // vault's news, and the feeds' rounds are there from the start too.
+        let vault = futures::stream::iter([Some(vault::VaultEvent::Halting("halted".into()))])
+            .chain(futures::stream::pending());
+        let ticks = futures::stream::iter(std::iter::repeat_with(|| None).take(100));
+        futures::executor::block_on(serve(&mut noted, vault_first(vault, ticks))).unwrap();
+        assert_eq!(noted.0, ["halt"], "an ordinary step within the halt");
+    }
+}

@@ -27,7 +27,8 @@ pub const SLIPPAGE: &str = "0.01";
 
 /// Gross exposure at most twice the vault's value.
 pub const MAX_GROSS_LEVERAGE: &str = "2";
-/// No single order above 5% of the vault.
+/// No single order above 5% of the vault, save a halt's closing orders
+/// (a halt's cap may come from a value read high: see `Picture::halting`).
 pub const MAX_ORDER_FRACTION: &str = "0.05";
 /// 6% of the vault kept liquid, so an ordinary withdrawal closes nothing.
 pub const IDLE_BUFFER: &str = "0.06";
@@ -43,3 +44,7 @@ pub const WEEKEND_UNTIL: (u8, u32) = (1, 13 * 3600 + 1800);
 
 /// Steps at most this often, in seconds, however busy the books are.
 pub const STEP_EVERY: u64 = 30;
+
+/// During a halt, a look that couldn't see everything held (a read failed,
+/// or a book not yet seen) is taken again no sooner than this, in seconds.
+pub const HALT_LOOKS_AGAIN_AFTER: u64 = 10;
