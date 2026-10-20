@@ -595,11 +595,14 @@ mod tests {
             assert!(!manifest.contains("fall from the vault's peak"));
             assert!(manifest.contains("couldn't be read"));
             assert!(manifest.contains("Sells everything only after a 10% fall"));
-            assert!(
-                manifest
-                    .contains("the stop holds until then, and a restart measures a share afresh")
-            );
-            assert!(manifest.contains("buys nothing until the agent restarts"));
+            assert!(manifest.contains(
+                "the stop holds until then, a read that fails never restarts it, and a restart \
+                 measures a share afresh"
+            ));
+            assert!(manifest.contains("buys nothing until the platform restarts the agent"));
+            assert!(manifest.contains("the stop is cleared when the platform restarts"));
+            assert!(manifest.contains("A read that fails is a look skipped"));
+            assert!(manifest.contains("No single order above 5% of the vault, save a halt's"));
             assert!(!manifest.contains("Only sells after"));
             assert!(!manifest.contains("lifts"));
         }

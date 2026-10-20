@@ -14,16 +14,19 @@
 
 mod config;
 mod decide;
+mod host;
 mod per_share;
 
 use decide::{
     Leavers, Patience, Plan, Quotes, Snapshot, Top, hedge, held, limits, spot_dollars, trim, unwind,
 };
-use futures::StreamExt;
+use futures::stream::PollNext;
+use futures::{Stream, StreamExt};
 use hl::{AccountState, Action, Balance, Order, Receipt, Side};
+use host::{Host, Sdk};
 use per_share::PerShare;
 use sdk::streams::{self, HYPERLIQUID, HyperliquidFeed, HyperliquidValue};
-use sdk::transfers::{self, Account, Moved, VenueAccount};
+use sdk::transfers::{Account, Moved, VenueAccount};
 use sdk::{Decimal, Limits, drivers, from_payload, millionths, to_payload, vault};
 use strategy_sdk as sdk;
 use strategy_sdk::hyperliquid as hl;
@@ -43,7 +46,8 @@ const HEDGE_ORDERS: usize = 8;
 struct FundingBasis;
 
 /// What the strategy knows. Rebuilt from the venue and the stream whenever
-/// it starts, so losing it to a restart costs a moment and nothing else.
+/// it starts, so losing it to a restart costs a moment, and the stop (see
+/// `per_share.rs`).
 struct Mind {
     limits: Limits,
     quotes: Quotes,
@@ -64,6 +68,9 @@ struct Mind {
     /// at worst sends it out once more for the next `buffer-low` to bring
     /// back.
     leavers: Leavers,
+    /// After a read that failed, the agent looks again no sooner than this
+    /// (seconds since the Unix epoch).
+    looks_again_at: u64,
 }
 
 impl Mind {
@@ -77,6 +84,7 @@ impl Mind {
             busy: false,
             patience: Patience::default(),
             leavers: Leavers::default(),
+            looks_again_at: 0,
         }
     }
 }
@@ -104,6 +112,7 @@ fn top_of(value: Result<streams::Stamped<HyperliquidValue>, String>) -> Option<T
 
 impl sdk::Agent for FundingBasis {
     async fn run() -> Result<(), String> {
+        let host = Sdk;
         let mut mind = Mind::new();
 
         let spot_book = streams::subscribe::<_, HyperliquidValue>(
@@ -137,57 +146,77 @@ impl sdk::Agent for FundingBasis {
             .map(Woke::Venue);
         let vault_events = vault::events().into_stream().map(Woke::Vault);
 
-        let mut waking = futures::stream::select_all([
+        let others = futures::stream::select_all([
             spot_book.boxed_local(),
             perp_book.boxed_local(),
             funding.boxed_local(),
             account.boxed_local(),
-            vault_events.boxed_local(),
         ]);
-
-        while let Some(woke) = waking.next().await {
-            match woke {
-                // Prices only update what the agent knows; it acts when
-                // funding or its account moves, not on every quote.
-                Woke::SpotBook(top) => mind.quotes.spot = top,
-                Woke::PerpBook(top) => mind.quotes.perp = top,
-                // Funding arrives every few seconds. It is looked at when it
-                // crosses a threshold, or while there is still something to
-                // do; otherwise the account's own events (fills, the hourly
-                // funding payment) are what wake the strategy.
-                Woke::Funding(daily) => {
-                    let before = mind.quotes.funding.replace(daily);
-                    if decide::steps_on_funding(before, daily, mind.busy) {
-                        step(&mut mind, false).await?;
-                    }
-                }
-                Woke::Venue(event) => {
-                    mind.funding_paid += decide::funding_paid(&event);
-                    if decide::wakes_for(&event) {
-                        step(&mut mind, false).await?
-                    }
-                }
-                Woke::Vault(vault::VaultEvent::ClaimPending(_)) => step(&mut mind, false).await?,
-                Woke::Vault(vault::VaultEvent::BufferLow(short)) => {
-                    // As much as the venue will let go of; a claim's close
-                    // covers whatever this doesn't.
-                    let _ = transfers::move_(venue(), Account::Vault, short).await;
-                    step(&mut mind, true).await?
-                }
-                Woke::Vault(vault::VaultEvent::Halting(_)) => {
-                    flatten(&mut mind).await?;
-                    return Ok(());
-                }
-                Woke::Nothing => {}
-            }
-        }
-        Ok(())
+        serve(&host, &mut mind, vault_first(vault_events, others)).await
     }
 }
 
-fn venue() -> Account {
+/// What wakes the agent, the vault's news always taken before anything
+/// else that is waiting: an agent started again within a halt finds the
+/// halting notice first in the vault's news, and must see it before it
+/// takes an ordinary step.
+fn vault_first(
+    vault: impl Stream<Item = Woke> + Unpin,
+    others: impl Stream<Item = Woke> + Unpin,
+) -> impl Stream<Item = Woke> + Unpin {
+    futures::stream::select_with_strategy(vault, others, |_: &mut ()| PollNext::Left)
+}
+
+/// Act on each wake until the vault halts. There is no look before the
+/// first wake, and the vault's news is read before anything else, so a
+/// start within a halt goes straight to the halt.
+async fn serve(
+    host: &impl Host,
+    mind: &mut Mind,
+    mut waking: impl Stream<Item = Woke> + Unpin,
+) -> Result<(), String> {
+    while let Some(woke) = waking.next().await {
+        match woke {
+            // Prices only update what the agent knows; it acts when
+            // funding or its account moves, not on every quote.
+            Woke::SpotBook(top) => mind.quotes.spot = top,
+            Woke::PerpBook(top) => mind.quotes.perp = top,
+            // Funding arrives every few seconds. It is looked at when it
+            // crosses a threshold, or while there is still something to
+            // do; otherwise the account's own events (fills, the hourly
+            // funding payment) are what wake the strategy.
+            Woke::Funding(daily) => {
+                let before = mind.quotes.funding.replace(daily);
+                if decide::steps_on_funding(before, daily, mind.busy) {
+                    step(host, mind, false).await?;
+                }
+            }
+            Woke::Venue(event) => {
+                mind.funding_paid += decide::funding_paid(&event);
+                if decide::wakes_for(&event) {
+                    step(host, mind, false).await?
+                }
+            }
+            Woke::Vault(vault::VaultEvent::ClaimPending(_)) => step(host, mind, false).await?,
+            Woke::Vault(vault::VaultEvent::BufferLow(short)) => {
+                // As much as the venue will let go of; a claim's close
+                // covers whatever this doesn't.
+                let _ = host.move_(venue(host), Account::Vault, short).await;
+                step(host, mind, true).await?
+            }
+            Woke::Vault(vault::VaultEvent::Halting(_)) => {
+                flatten(host, mind, &mut waking).await?;
+                return Ok(());
+            }
+            Woke::Nothing => {}
+        }
+    }
+    Ok(())
+}
+
+fn venue(host: &impl Host) -> Account {
     Account::Venue(VenueAccount {
-        chain: transfers::home_chain(),
+        chain: host.home_chain(),
         driver: DRIVER.to_string(),
     })
 }
@@ -195,8 +224,23 @@ fn venue() -> Account {
 /// Look at what is there, work out what should be there, and act on it if
 /// that is worth doing. `brought_home` says cash has just come home for
 /// leavers.
-async fn step(mind: &mut Mind, brought_home: bool) -> Result<(), String> {
-    let state = read_state().await?;
+///
+/// A read that fails skips the look, and is no fault: a fault ends `run`,
+/// and the platform starts the agent again with its measure, and the stop
+/// with it, afresh. The agent looks again at the first wake
+/// `LOOKS_AGAIN_AFTER` on.
+async fn step(host: &impl Host, mind: &mut Mind, brought_home: bool) -> Result<(), String> {
+    if host.now() < mind.looks_again_at {
+        return Ok(());
+    }
+    let state = match read_state(host).await {
+        Ok(state) => state,
+        Err(error) => {
+            host.note(&format!("look skipped: a read failed: {error}"));
+            mind.looks_again_at = host.now() + config::LOOKS_AGAIN_AFTER;
+            return Ok(());
+        }
+    };
     let holdings = decide::share_holdings(&state, &mind.quotes, mind.funding_paid);
     // The driver reads the account and the vault whole or not at all, so
     // its value is what its holdings account for.
@@ -226,7 +270,7 @@ async fn step(mind: &mut Mind, brought_home: bool) -> Result<(), String> {
         mind.leavers.taken(fund.from_vault);
     }
     let limits = mind.limits;
-    if carry_out(mind, &limits, &state, &plan).await? {
+    if carry_out(host, mind, &limits, &state, &plan).await? {
         mind.patience.went_through();
     } else {
         mind.patience.refused(at);
@@ -234,8 +278,8 @@ async fn step(mind: &mut Mind, brought_home: bool) -> Result<(), String> {
     Ok(())
 }
 
-async fn read_state() -> Result<AccountState, String> {
-    from_payload(&drivers::account_state(DRIVER.to_string(), Vec::new()).await?)
+async fn read_state(host: &impl Host) -> Result<AccountState, String> {
+    from_payload(&host.account_state(DRIVER, Vec::new()).await?)
 }
 
 /// Do what `plan` says, and say whether any of it went through.
@@ -246,6 +290,7 @@ async fn read_state() -> Result<AccountState, String> {
 /// the step ends; on the way out the short goes first and the spot follows
 /// what was bought back.
 async fn carry_out(
+    host: &impl Host,
     mind: &mut Mind,
     limits: &Limits,
     state: &AccountState,
@@ -261,13 +306,13 @@ async fn carry_out(
             // without a close. A move that stopped in the station, or whose
             // fate is unknown, is counted as outside the vault from then on,
             // so it is never sent twice.
-            let home = transfers::home_chain();
+            let home = host.home_chain();
             for (from, amount) in [
                 (Account::Station(home), fund.from_station),
                 (Account::Vault, fund.from_vault),
             ] {
                 if amount > decide::zero() {
-                    match transfers::move_(from, venue(), millionths(amount)).await {
+                    match host.move_(from, venue(host), millionths(amount)).await {
                         Moved::Done => landed = true,
                         Moved::Partial(_) => return Ok(true),
                         Moved::Refused(_) | Moved::Unknown(_) => return Ok(landed),
@@ -281,16 +326,19 @@ async fn carry_out(
                 let cost = order.size * order.limit_price;
                 let spot_cash = spot_dollars(state);
                 if spot_cash < cost {
-                    let verdicts = submit(&[Action::MoveDollars {
-                        from: Balance::Perp,
-                        amount: decide::round_up_cents(cost - spot_cash),
-                    }])
+                    let verdicts = submit(
+                        host,
+                        &[Action::MoveDollars {
+                            from: Balance::Perp,
+                            amount: decide::round_up_cents(cost - spot_cash),
+                        }],
+                    )
                     .await?;
                     if !matches!(verdicts.first(), Some(sdk::Verdict::Accepted(_))) {
                         return Ok(landed);
                     }
                 }
-                match place(order).await? {
+                match place(host, order).await? {
                     Some(size) => {
                         landed = true;
                         spot_held += size;
@@ -303,14 +351,17 @@ async fn carry_out(
                     break;
                 };
                 if !mind.levered {
-                    let verdicts = submit(&[Action::Leverage {
-                        market: config::PERP.into(),
-                        leverage: config::PERP_LEVERAGE,
-                    }])
+                    let verdicts = submit(
+                        host,
+                        &[Action::Leverage {
+                            market: config::PERP.into(),
+                            leverage: config::PERP_LEVERAGE,
+                        }],
+                    )
                     .await?;
                     mind.levered = matches!(verdicts.first(), Some(sdk::Verdict::Accepted(_)));
                 }
-                match place(&order).await? {
+                match place(host, &order).await? {
                     Some(size) if size != decide::zero() => {
                         landed = true;
                         perp_held += size;
@@ -322,13 +373,13 @@ async fn carry_out(
         Plan::Reduce { perp } => {
             let (spot_held, mut perp_held) = held(state);
             if let Some(order) = perp
-                && let Some(size) = place(order).await?
+                && let Some(size) = place(host, order).await?
             {
                 landed = true;
                 perp_held += size;
             }
             if let Some(order) = trim(limits, state, &mind.quotes, spot_held, perp_held) {
-                landed |= place(&order).await?.is_some();
+                landed |= place(host, &order).await?.is_some();
             }
         }
     }
@@ -337,14 +388,28 @@ async fn carry_out(
 
 /// Close everything, perp first, because a halt is an unwind with less time.
 /// The per-order cap is lifted: leaving a leg on would cost the depositors
-/// more than a wider fill.
-async fn flatten(mind: &mut Mind) -> Result<(), String> {
+/// more than a wider fill. A read that fails is looked again at after a
+/// pause, within the same bound of looks, rather than ending the agent.
+async fn flatten(
+    host: &impl Host,
+    mind: &mut Mind,
+    waking: &mut (impl Stream<Item = Woke> + Unpin),
+) -> Result<(), String> {
     let limits = Limits {
         max_order_fraction: Decimal::from(1),
         ..mind.limits
     };
     for _ in 0..FLATTEN_STEPS {
-        let state = read_state().await?;
+        let state = match read_state(host).await {
+            Ok(state) => state,
+            Err(error) => {
+                host.note(&format!("halt's look skipped: a read failed: {error}"));
+                if !pause(host, mind, waking, config::LOOKS_AGAIN_AFTER).await {
+                    break;
+                }
+                continue;
+            }
+        };
         let plan = Plan::Reduce {
             perp: unwind(&limits, &state, &mind.quotes),
         };
@@ -352,15 +417,15 @@ async fn flatten(mind: &mut Mind) -> Result<(), String> {
         if perp == decide::zero() && trim(&limits, &state, &mind.quotes, spot, perp).is_none() {
             return Ok(());
         }
-        carry_out(mind, &limits, &state, &plan).await?;
+        carry_out(host, mind, &limits, &state, &plan).await?;
     }
     Ok(())
 }
 
 /// Send one order, and say how much of it filled, signed as the position
 /// moved: nothing if it was refused, missed the book, or went unanswered.
-async fn place(order: &Order) -> Result<Option<Decimal>, String> {
-    let verdicts = submit(&[Action::Place(order.clone())]).await?;
+async fn place(host: &impl Host, order: &Order) -> Result<Option<Decimal>, String> {
+    let verdicts = submit(host, &[Action::Place(order.clone())]).await?;
     let Some(sdk::Verdict::Accepted(receipt)) = verdicts.first() else {
         return Ok(None);
     };
@@ -375,9 +440,31 @@ async fn place(order: &Order) -> Result<Option<Decimal>, String> {
 
 /// Send actions. A refusal is not a reason to stop: the next event is
 /// another chance.
-async fn submit(actions: &[Action]) -> Result<Vec<sdk::Verdict>, String> {
+async fn submit(host: &impl Host, actions: &[Action]) -> Result<Vec<sdk::Verdict>, String> {
     let encoded: Vec<Vec<u8>> = actions.iter().map(to_payload).collect();
-    Ok(drivers::submit(DRIVER.to_string(), encoded).await)
+    Ok(host.submit(DRIVER, encoded).await)
+}
+
+/// Wait at least `seconds` on whatever wakes the agent, which has no timer
+/// of its own, keeping each quote that arrives meanwhile; false once
+/// nothing will wake it again.
+async fn pause(
+    host: &impl Host,
+    mind: &mut Mind,
+    waking: &mut (impl Stream<Item = Woke> + Unpin),
+    seconds: u64,
+) -> bool {
+    let until = host.now() + seconds;
+    while host.now() < until {
+        match waking.next().await {
+            Some(Woke::SpotBook(top)) => mind.quotes.spot = top,
+            Some(Woke::PerpBook(top)) => mind.quotes.perp = top,
+            Some(Woke::Funding(daily)) => mind.quotes.funding = Some(daily),
+            Some(_) => {}
+            None => return false,
+        }
+    }
+    true
 }
 
 sdk::export_agent!(FundingBasis);
@@ -415,12 +502,215 @@ mod tests {
         );
         assert!(manifest.contains("a fall from before a restart is not remembered"));
         assert!(!manifest.contains("fall from the vault's peak"));
-        assert!(
-            manifest.contains("the stop holds until then, and a restart measures a share afresh")
-        );
-        assert!(manifest.contains("opens nothing until the agent restarts"));
+        assert!(manifest.contains(
+            "the stop holds until then, a read that fails never restarts it, and a restart \
+             measures a share afresh"
+        ));
+        assert!(manifest.contains("opens nothing until the platform restarts the agent"));
+        assert!(manifest.contains("the stop is cleared when the platform restarts"));
+        assert!(manifest.contains("A read that fails is a look skipped"));
         assert!(manifest.contains("save a halt's closing orders"));
         assert!(!manifest.contains("lifts") && !manifest.contains("Only reduces"));
         assert!(manifest.contains("[drivers.hyperliquid]"));
+    }
+
+    use hl::{Position, SpotBalance};
+    use std::cell::{Cell, RefCell};
+
+    /// A stand-in for the host: the account as the test sets it, every
+    /// order filled in full, every move landing, and the next `failing`
+    /// reads failing.
+    struct Fake {
+        clock: Cell<u64>,
+        state: RefCell<AccountState>,
+        failing: Cell<u32>,
+        /// Actions sent and moves made.
+        sent: Cell<u32>,
+        /// Each action sent, and each move made (as `None`).
+        log: RefCell<Vec<Option<Action>>>,
+    }
+
+    impl Fake {
+        fn new(state: AccountState) -> Self {
+            Self {
+                clock: Cell::new(1_000_000),
+                state: RefCell::new(state),
+                failing: Cell::new(0),
+                sent: Cell::new(0),
+                log: RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl Host for Fake {
+        fn home_chain(&self) -> String {
+            "hyperevm".into()
+        }
+
+        fn now(&self) -> u64 {
+            // Each look at the clock is a second on.
+            self.clock.set(self.clock.get() + 1);
+            self.clock.get()
+        }
+
+        fn note(&self, _: &str) {}
+
+        async fn account_state(&self, _: &str, _: Vec<u8>) -> Result<Vec<u8>, String> {
+            if self.failing.get() > 0 {
+                self.failing.set(self.failing.get() - 1);
+                return Err("the venue timed out".into());
+            }
+            Ok(to_payload(&*self.state.borrow()))
+        }
+
+        async fn submit(&self, _: &str, actions: Vec<Vec<u8>>) -> Vec<sdk::Verdict> {
+            self.sent.set(self.sent.get() + 1);
+            let action = from_payload::<Action>(&actions[0]).unwrap();
+            self.log.borrow_mut().push(Some(action.clone()));
+            let receipt = match action {
+                Action::Place(order) => Receipt::Filled {
+                    order_id: 1,
+                    size: order.size,
+                    average_price: order.limit_price,
+                },
+                _ => Receipt::Done,
+            };
+            vec![sdk::Verdict::Accepted(to_payload(&receipt))]
+        }
+
+        async fn move_(&self, _: Account, _: Account, _: u64) -> Moved {
+            self.sent.set(self.sent.get() + 1);
+            self.log.borrow_mut().push(None);
+            Moved::Done
+        }
+    }
+
+    /// A vault with $85,000 of cash and $15,000 on the account's perp side,
+    /// holding `held` HYPE against as much shorted, HYPE's spot at `spot`.
+    fn account(held: &str, spot: &str) -> AccountState {
+        let held = decimal(held);
+        AccountState {
+            vault_value: decimal("100000") + held * decimal(spot) - held * decimal("25"),
+            idle: decimal("85000"),
+            station_idle: decide::zero(),
+            account_value: decimal("15000"),
+            withdrawable: decimal("15000"),
+            positions: vec![Position {
+                market: config::PERP.to_string(),
+                size: -held,
+                entry_price: None,
+                leverage: config::PERP_LEVERAGE,
+            }],
+            spot: vec![
+                SpotBalance {
+                    token: "USDC".to_string(),
+                    total: decide::zero(),
+                    hold: decide::zero(),
+                },
+                SpotBalance {
+                    token: config::SPOT_TOKEN.to_string(),
+                    total: held,
+                    hold: decide::zero(),
+                },
+            ],
+            open_orders: Vec::new(),
+        }
+    }
+
+    /// Both books about `spot` and $25, and funding well above entry.
+    fn quotes(spot: &str) -> Quotes {
+        let top = |mid: Decimal| Top {
+            bid: Some(mid - decimal("0.01")),
+            ask: Some(mid + decimal("0.01")),
+        };
+        Quotes {
+            spot: top(decimal(spot)),
+            perp: top(decimal("25")),
+            funding: Some(decimal("0.001")),
+        }
+    }
+
+    fn look(host: &Fake, mind: &mut Mind, spot: &str) {
+        mind.quotes = quotes(spot);
+        futures::executor::block_on(step(host, mind, false)).expect("a step is no fault");
+    }
+
+    #[test]
+    fn a_read_that_fails_after_the_stop_leaves_the_stop_on_and_opens_nothing() {
+        let host = Fake::new(account("1000", "25"));
+        let mut mind = Mind::new();
+        look(&host, &mut mind, "25");
+        // HYPE's spot falls $13 under the perpetual: $13,000 of the vault
+        // lost, stopped.
+        *host.state.borrow_mut() = account("1000", "12");
+        look(&host, &mut mind, "12");
+        assert!(mind.per_share.stopped());
+        // Closed out, and the spot back where it was.
+        *host.state.borrow_mut() = account("0", "25");
+        look(&host, &mut mind, "25");
+        // A read fails: the step is no fault, so the agent is not started
+        // again, and its stop holds.
+        host.failing.set(1);
+        assert_eq!(
+            futures::executor::block_on(step(&host, &mut mind, false)),
+            Ok(()),
+            "a failed read ends the agent"
+        );
+        assert!(mind.per_share.stopped(), "the stop was cleared");
+        let before = host.sent.get();
+        for _ in 0..32 {
+            look(&host, &mut mind, "25");
+        }
+        assert!(mind.per_share.stopped());
+        assert_eq!(host.sent.get(), before, "opened again");
+        // What a measure started afresh would have done there.
+        let mut fresh = Mind::new();
+        look(&host, &mut fresh, "25");
+        assert!(host.sent.get() > before);
+    }
+
+    #[test]
+    fn a_halt_whose_read_fails_looks_again_after_a_pause_and_still_closes() {
+        let host = Fake::new(account("1000", "25"));
+        host.failing.set(2);
+        let mut mind = Mind::new();
+        mind.quotes = quotes("25");
+        let mut waking = futures::stream::iter(
+            std::iter::repeat_with(|| Woke::Funding(decimal("0.001"))).take(1_000),
+        );
+        let before = host.clock.get();
+        futures::executor::block_on(flatten(&host, &mut mind, &mut waking)).unwrap();
+        assert!(host.sent.get() > 0, "closed nothing");
+        assert!(host.clock.get() - before >= 2 * config::LOOKS_AGAIN_AFTER);
+    }
+
+    #[test]
+    fn a_start_inside_a_halt_opens_nothing_and_goes_to_flatten() {
+        // Holding a little, with funding above entry: an ordinary look
+        // would add to both legs.
+        let host = Fake::new(account("100", "25"));
+        let mut mind = Mind::new();
+        mind.quotes = quotes("25");
+        // No funding heard yet: the first to come is looked at.
+        mind.quotes.funding = None;
+        // Started again within the halt: the notice waits first in the
+        // vault's news, and funding is there from the start too.
+        let halting = Woke::Vault(vault::VaultEvent::Halting("halted".into()));
+        let vault = futures::stream::iter([halting]).chain(futures::stream::pending());
+        let funding = futures::stream::iter(
+            std::iter::repeat_with(|| Woke::Funding(decimal("0.001"))).take(1_000),
+        );
+        futures::executor::block_on(serve(&host, &mut mind, vault_first(vault, funding))).unwrap();
+        let log = host.log.borrow();
+        assert!(!log.is_empty(), "never went to the halt");
+        assert!(
+            // Only closes: the short bought back, the spot sold.
+            log.iter().all(|sent| matches!(
+                sent,
+                Some(Action::Place(order))
+                    if order.reduce_only || (order.market == config::SPOT && order.side == Side::Sell)
+            )),
+            "added within the halt"
+        );
     }
 }

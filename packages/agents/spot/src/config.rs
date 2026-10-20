@@ -35,7 +35,8 @@ pub struct Venue {
 /// A token is put back to its weight once it is further than this from it,
 /// as a fraction of the vault.
 pub const BAND: &str = "0.03";
-/// No single order above 5% of the vault.
+/// No single order above 5% of the vault, save a halt's closing orders
+/// (a halt's cap may come from a value read high: see `Picture::halting`).
 pub const MAX_ORDER_FRACTION: &str = "0.05";
 /// Below this many dollars, an order is not worth its fee.
 pub const MINIMUM_NOTIONAL: &str = "1";
@@ -53,3 +54,6 @@ pub const DRAWDOWN_STOP: &str = "0.10";
 
 /// Looks at most this often, in seconds.
 pub const STEP_EVERY: u64 = 60;
+/// During a halt, a look one of whose reads failed is taken again no
+/// sooner than this, in seconds.
+pub const HALT_LOOKS_AGAIN_AFTER: u64 = 10;
